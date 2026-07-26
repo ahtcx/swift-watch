@@ -1,0 +1,2 @@
+[vars]
+swift_reproducibility_args = "-Xswiftc -gnone -Xcc -g0"

@@ -1,0 +1,2 @@
+[vars]
+swift_reproducibility_args = "-Xswiftc -gnone -Xcc -g0 -Xswiftc -use-ld=lld -Xlinker -T -Xlinker Scripts/discard-swift-modhash.ld"

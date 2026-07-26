@@ -1,0 +1,138 @@
+name: Release
+
+on:
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: Release tag to create or update
+        required: true
+        type: string
+      title:
+        description: Draft release title
+        required: false
+        type: string
+      target:
+        description: Branch or commit to create the tag from when missing
+        required: false
+        default: main
+        type: string
+
+permissions:
+  contents: write
+  id-token: write
+  attestations: write
+
+jobs:
+  load-matrix:
+    name: Load platform matrix
+    runs-on: &default-runner ubuntu-latest
+    outputs:
+      matrix: ${{ steps.read.outputs.matrix }}
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - id: read
+        run: |
+          matrix="$(python3 -c 'import json, pathlib; print(json.dumps(json.loads(pathlib.Path(".github/platform-matrix.json").read_text()), separators=(",", ":")) )')"
+          echo "matrix=${matrix}" >> "$GITHUB_OUTPUT"
+
+  build-release-assets:
+    name: Build release assets (${{ matrix.name }})
+    needs:
+      - load-matrix
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix: ${{ fromJson(needs.load-matrix.outputs.matrix) }}
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install toolchain
+        uses: jdx/mise-action@v4
+
+      - name: Build release assets
+        run: mise run build:release
+
+      - name: Show built asset path
+        id: asset
+        run: |
+          asset_path="$(mise run build:show-bin-path)/swift-watch"
+          ls -l "$asset_path"
+          echo "path=$asset_path" >> "$GITHUB_OUTPUT"
+
+      - name: Attest build provenance
+        uses: actions/attest@v4
+        with:
+          subject-path: ${{ steps.asset.outputs.path }}
+
+      - name: Upload workflow artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: release-assets-${{ matrix.name }}
+          path: ${{ steps.asset.outputs.path }}
+          if-no-files-found: error
+
+  create-draft-release:
+    name: Create draft release
+    runs-on: *default-runner
+    needs:
+      - load-matrix
+
+    outputs:
+      title: ${{ steps.create.outputs.title }}
+
+    steps:
+      - name: Create or validate draft release
+        id: create
+        env:
+          GITHUB_TOKEN: ${{ github.token }}
+          GH_REPO: ${{ github.repository }}
+          RELEASE_TAG: ${{ inputs.tag }}
+          RELEASE_TITLE: ${{ inputs.title }}
+          RELEASE_TARGET: ${{ inputs.target }}
+        run: |
+          release_title="${RELEASE_TITLE:-$RELEASE_TAG}"
+          echo "title=${release_title}" >> "$GITHUB_OUTPUT"
+
+          if gh release view "$RELEASE_TAG" --json isDraft >/tmp/release.json 2>/dev/null; then
+            if [ "$(python3 -c 'import json; import pathlib; print(json.loads(pathlib.Path("/tmp/release.json").read_text())["isDraft"])')" != "True" ]; then
+              echo "Release $RELEASE_TAG already exists and is not a draft" >&2
+              exit 1
+            fi
+          else
+            gh release create "$RELEASE_TAG" \
+              --draft \
+              --title "$release_title" \
+              --target "$RELEASE_TARGET"
+          fi
+
+  upload-release-assets:
+    name: Upload draft release assets
+    runs-on: *default-runner
+    needs:
+      - create-draft-release
+      - build-release-assets
+
+    steps:
+      - name: Download workflow artifacts
+        uses: actions/download-artifact@v4
+        with:
+          pattern: release-assets-*
+
+      - name: Prepare release asset filenames
+        env:
+          RELEASE_TAG: ${{ inputs.tag }}
+        run: |
+          for artifact_dir in release-assets-*; do
+            platform="${artifact_dir#release-assets-}"
+            cp -f "$artifact_dir/swift-watch" "swift-watch-${RELEASE_TAG}-${platform}"
+          done
+
+      - name: Upload release assets
+        env:
+          GITHUB_TOKEN: ${{ github.token }}
+          GH_REPO: ${{ github.repository }}
+          RELEASE_TAG: ${{ inputs.tag }}
+        run: gh release upload "$RELEASE_TAG" swift-watch-* --clobber

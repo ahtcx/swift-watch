@@ -1,0 +1,60 @@
+name: CI
+
+on:
+  push:
+    branches:
+      - main
+  pull_request:
+    branches:
+      - main
+
+jobs:
+  load-matrix:
+    name: Load platform matrix
+    runs-on: ubuntu-latest
+    outputs:
+      matrix: ${{ steps.read.outputs.matrix }}
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - id: read
+        run: |
+          matrix="$(python3 -c 'import json, pathlib; print(json.dumps(json.loads(pathlib.Path(".github/platform-matrix.json").read_text()), separators=(",", ":")) )')"
+          echo "matrix=${matrix}" >> "$GITHUB_OUTPUT"
+
+  test:
+    name: Test (${{ matrix.name }})
+    needs:
+      - load-matrix
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix: ${{ fromJson(needs.load-matrix.outputs.matrix) }}
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install toolchain
+        uses: jdx/mise-action@v4
+
+      - name: Run tests
+        run: mise run test
+
+  reproducibility:
+    name: Reproducibility (${{ matrix.name }})
+    needs:
+      - load-matrix
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix: ${{ fromJson(needs.load-matrix.outputs.matrix) }}
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install toolchain
+        uses: jdx/mise-action@v4
+
+      - name: Compare release binaries
+        run: mise run reproducibility-check

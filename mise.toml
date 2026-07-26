@@ -1,0 +1,42 @@
+[settings]
+lockfile = true
+locked = true
+lockfile_platforms = ["linux-x64", "linux-arm64", "macos-arm64", "macos-x64"]
+
+[vars]
+swift_reproducibility_args = ""
+
+[tools]
+swift = "6.3.3"
+
+[tasks.test]
+description = "Run the test suite"
+run = "swift test"
+
+[tasks.format]
+description = "Format Swift sources in place"
+run = "swift format format --in-place --recursive --configuration .swift-format Sources Tests Plugins Package.swift"
+
+[tasks.lint]
+description = "Check Swift source formatting without rewriting files"
+run = "swift format lint --strict --recursive --configuration .swift-format Sources Tests Plugins Package.swift"
+
+[tasks."build:release"]
+description = "Build the release executable"
+usage = 'flag "--scratch-path <path>" help="SwiftPM scratch directory" default=".build"'
+run = 'swift build --configuration release --scratch-path {{ usage.scratch_path }} {{ vars.swift_reproducibility_args }}'
+
+[tasks."build:show-bin-path"]
+description = "Print the release executable output directory"
+run = 'swift build --configuration release {{ vars.swift_reproducibility_args }} --show-bin-path'
+
+[tasks.reproducibility-check]
+description = "Build twice in isolated scratch directories and compare the resulting binaries"
+depends = [
+	"build:release --scratch-path .build/reproducibility-check/first",
+	"build:release --scratch-path .build/reproducibility-check/second",
+]
+run = [
+	'cmp ".build/reproducibility-check/first/release/swift-watch" ".build/reproducibility-check/second/release/swift-watch"',
+	'shasum -a 256 ".build/reproducibility-check/first/release/swift-watch" ".build/reproducibility-check/second/release/swift-watch"',
+]
