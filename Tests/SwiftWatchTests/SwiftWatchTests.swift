@@ -1236,7 +1236,7 @@ func `build command captures trailing arguments for swift build`() throws {
 }
 
 @Test
-func `build command parses explicit target and product selection`() throws {
+func `build command keeps target and product in forwarded arguments`() throws {
 	let command = try SwiftWatchCommand.parseAsRoot([
 		"build",
 		"--target", "Foo",
@@ -1249,25 +1249,45 @@ func `build command parses explicit target and product selection`() throws {
 		return
 	}
 
-	#expect(build.target == "Foo")
-	#expect(build.product == "Bar")
-	#expect(build.swiftArgs == ["--configuration", "release"])
+	#expect(
+		build.swiftArgs == [
+			"--target", "Foo",
+			"--product", "Bar",
+			"--configuration", "release",
+		])
 }
 
 @Test
-func `forwarded selection flags are detected for the warning`() {
+func `forwarded build selection is read from forwarded arguments`() {
 	#expect(
-		forwardedSelectionFlags(in: ["--target", "Foo", "-v"]) == ["--target"])
+		forwardedBuildSelection(in: ["--target", "Foo", "-v"]).explicitNames
+			== ["Foo"])
 	#expect(
-		forwardedSelectionFlags(in: ["--product=Bar"]) == ["--product=Bar"])
+		forwardedBuildSelection(in: ["--product=Bar"]).explicitNames
+			== ["Bar"])
 	#expect(
-		forwardedSelectionFlags(in: ["--configuration", "release"]).isEmpty)
-	// Flags after `swift-watch build`'s first unrecognized argument land in
-	// the passthrough list rather than in the parsed options, so the scan
-	// must see them there.
+		forwardedBuildSelection(
+			in: ["--target", "Old", "--configuration", "release", "--target=New"]
+		).explicitNames == ["New"])
 	#expect(
-		forwardedSelectionFlags(in: ["--configuration", "release", "--target", "Foo"])
-			== ["--target"])
+		forwardedBuildSelection(
+			in: ["--target", "Foo", "--product", "Bar"]
+		).explicitNames == ["Foo", "Bar"])
+	#expect(
+		forwardedBuildSelection(in: ["--configuration", "release"]).explicitNames
+			.isEmpty)
+}
+
+@Test
+func `a malformed selection flag selects nothing rather than failing`() {
+	// `swift build` reports its own argument errors, and an unresolved name
+	// would fall back to watching the whole root package anyway.
+	#expect(forwardedBuildSelection(in: ["--target"]).explicitNames.isEmpty)
+	#expect(
+		forwardedBuildSelection(in: ["--target="]).explicitNames == [""])
+	#expect(
+		forwardedBuildSelection(in: ["--product", "--configuration", "release"])
+			.explicitNames == ["--configuration"])
 }
 
 @Test

@@ -21,11 +21,11 @@ run = 'swift test {{ vars.swift_strict_args }}'
 
 [tasks.format]
 description = "Format Swift sources in place"
-run = "swift format format --in-place --recursive --configuration .swift-format Sources Tests Plugins Package.swift"
+run = "swift format format --in-place --recursive --configuration .swift-format Sources Tests Package.swift"
 
 [tasks.lint]
 description = "Check Swift source formatting without rewriting files"
-run = "swift format lint --strict --recursive --configuration .swift-format Sources Tests Plugins Package.swift"
+run = "swift format lint --strict --recursive --configuration .swift-format Sources Tests Package.swift"
 
 [tasks."build:release"]
 description = "Build the release executable"

@@ -2,18 +2,11 @@
 
 import PackageDescription
 
-// Warnings are treated as errors by the repository's own build and test tasks
-// rather than here: this manifest is what anyone building from source compiles
-// through, and a warning introduced by a newer toolchain would turn into a
-// failed install rather than a review comment. See `swift_strict_args` in
-// mise.toml, where the pinned compiler makes what warns deterministic.
-
 let package = Package(
 	name: "swift-watch",
 	platforms: [.macOS(.v13)],
 	products: [
-		.executable(name: "swift-watch", targets: ["swift-watch"]),
-		.plugin(name: "SwiftWatchPlugin", targets: ["SwiftWatchPlugin"]),
+		.executable(name: "swift-watch", targets: ["swift-watch"])
 	],
 	dependencies: [
 		.package(url: "https://github.com/apple/swift-argument-parser.git", exact: "1.8.2"),
@@ -58,22 +51,6 @@ let package = Package(
 					condition: .when(platforms: [.linux])),
 				.product(name: "ArgumentParser", package: "swift-argument-parser"),
 			]
-		),
-		.plugin(
-			name: "SwiftWatchPlugin",
-			capability: .command(
-				intent: .custom(
-					verb: "swift-watch",
-					description: "Invoke the swift-watch executable."
-				),
-				permissions: [
-					.writeToPackageDirectory(
-						reason:
-							"Runs builds and launches executables from the package directory."
-					)
-				]
-			),
-			dependencies: ["swift-watch"]
 		),
 		.testTarget(
 			name: "SwiftWatchTests",

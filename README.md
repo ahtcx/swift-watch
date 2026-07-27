@@ -1,12 +1,6 @@
 # swift-watch
 
-Rerun `swift build`, `swift run`, or `swift test` whenever your Swift package changes.
-
-```sh
-swift-watch run
-```
-
-Edit a file, and your executable is rebuilt and restarted.
+Rerun `swift run`, `swift test`, or `swift build` whenever your Swift package changes. Edit a file, and your executable is rebuilt and restarted.
 
 ## Install
 
@@ -14,17 +8,17 @@ Edit a file, and your executable is rebuilt and restarted.
 curl -fsSL https://raw.githubusercontent.com/ahtcx/swift-watch/main/install.sh | sh
 ```
 
-Drops the latest binary in `~/.local/bin`. Run the same command again to update, and `rm ~/.local/bin/swift-watch` to uninstall.
+Downloads the latest binary to `~/.local/bin`. Run the same command again to update, and `rm ~/.local/bin/swift-watch` to uninstall.
 
-If you use [mise](https://mise.jdx.dev): `mise use -g github:ahtcx/swift-watch`. Binaries are also on the [releases page](https://github.com/ahtcx/swift-watch/releases).
+If you use [mise](https://mise.jdx.dev): `mise use -g github:ahtcx/swift-watch`. Binaries are listed on the [releases page](https://github.com/ahtcx/swift-watch/releases).
 
 ## Usage
 
-Take any `swift build`, `swift run`, or `swift test` command and swap `swift` for `swift-watch`:
+Take any `swift run`, `swift test`, or `swift build` command and swap `swift` for `swift-watch`:
 
 ```sh
-swift test --filter MyTests        # runs once
-swift-watch test --filter MyTests  # runs on every change
+swift test --filter MyTests # runs once
+swift-watch test --filter MyTests # runs on every change
 ```
 
 Anything swift-watch doesn't recognize is forwarded straight through:
@@ -35,9 +29,10 @@ swift-watch build --target MyLibrary
 swift-watch test --parallel
 ```
 
+Pass swift-watch's own options first. Everything from the first argument it doesn't recognize onwards is forwarded untouched, so `swift-watch build --debounce 500 --configuration release` works while the reverse order sends `--debounce` to `swift build`.
+
 Options:
 
-- `--target <name>`, `--product <name>` (`build` only) — build just that module and watch only the files it depends on
 - `--package-path <path>` — package to watch, default `.`
 - `--watcher <name>` — file-watching backend: `fsevents` (macOS, default), `inotify` (Linux, default), `polling` (anywhere)
 - `--debounce <ms>` — window for grouping rapid changes, default `300`
@@ -46,7 +41,13 @@ Options:
 - `--disable-rule <name>` — turn off one of the rules below, repeatable
 - `--explain` — print which rule made each change count
 
-Put `--target`/`--product` before any forwarded arguments. swift-watch can only scope the watch to flags it parses itself, and prints a warning if they land in the forwarded list instead.
+Some forwarded flags are read on the way past. They are still forwarded unchanged — swift-watch only takes what it needs to watch the right files:
+
+- `--scratch-path <path>`, `--build-path <path>`, `--cache-path <path>` — excluded from watching, so redirected build output cannot retrigger the loop
+- `--build-system <name>` — used to find the matching planned-build manifest
+- `--target <name>`, `--product <name>` (`build` only) — scope watching to that module's dependency closure
+
+A name that resolves to nothing simply leaves the watch at its default breadth, which is the whole root package.
 
 ## What gets watched
 
@@ -76,10 +77,6 @@ Never watched: `.build`, `.git`, `.swiftpm`, hidden files and directories (Swift
 
 Watching starts before each build, so edits made while a build is running are picked up on the next cycle rather than lost.
 
-### Restarting
-
-`swift-watch run` interrupts the running executable before it rebuilds: `SIGINT` first, to the executable's own process group so that anything it spawned is included, and `SIGKILL` only for whatever is still alive 30 seconds later. Cleanup on shutdown therefore runs exactly as it would if you pressed Ctrl-C. The executable keeps the terminal it was launched from, so it reads input and prints as it would had you run it yourself.
-
 ### Rules
 
 Paths the build itself reported reading are always watched, and build output never is. Past that, four rules widen to files no build has read yet, so that adding one rebuilds instead of waiting for an unrelated edit. Each can be turned off with `--disable-rule <name>`:
@@ -96,20 +93,3 @@ Paths the build itself reported reading are always watched, and build output nev
 ```
   Sources/App/Protos/README.md: plugin-input-directories (inside Sources/App/Protos, which the build reads inputs from)
 ```
-
-## Plugin
-
-Or skip installing and add it to your package:
-
-```swift
-dependencies: [
-	.package(url: "https://github.com/ahtcx/swift-watch.git", from: "0.0.0")
-]
-```
-
-```sh
-swift package swift-watch build
-swift package swift-watch run
-```
-
-SwiftPM will ask for permission to write to the package directory — pass `--allow-writing-to-package-directory` to skip the prompt.

@@ -10,14 +10,18 @@
 enum TargetClosure {
 	/// Returns the reachable target names per package root.
 	///
-	/// By default every target of the root package is a seed, regardless of
-	/// which product or target `swift build`/`swift run` was asked for:
-	/// forwarded arguments are opaque to swift-watch, so narrowing the seeds
-	/// could silently miss edits. An explicit selection narrows the seeds to
-	/// the named targets or products only when every name resolves; anything
-	/// unresolved falls back to the broad default. Product names that resolve
-	/// to more than one local package broaden to all matches for the same
-	/// reason.
+	/// By default every target of the root package is a seed, because a
+	/// selection swift-watch cannot read for certain must not narrow the
+	/// watch: missing an edit is worse than watching too much.
+	///
+	/// An explicit selection — the `--target`/`--product` swift-watch reads
+	/// out of `swift build`'s forwarded arguments — narrows the seeds to the
+	/// named targets or products, but only when every name resolves; anything
+	/// unresolved falls back to the broad default, so a value misread out of
+	/// the forwarded arguments costs nothing. Candidate names, such as the
+	/// executable `swift run` was given, only ever add seeds. Product names
+	/// that resolve to more than one local package broaden to all matches for
+	/// the same reason.
 	static func reachedTargets(
 		from rootPackageRoot: URL,
 		in packages: [URL: DescribedPackage],

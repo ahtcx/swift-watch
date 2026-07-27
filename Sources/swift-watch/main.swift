@@ -128,22 +128,20 @@ struct SwiftWatchCommand: AsyncParsableCommand {
 extension SwiftWatchCommand {
 	struct Build: AsyncParsableCommand {
 		static let configuration = CommandConfiguration(
-			abstract: "Run `swift build` in a watch loop."
+			abstract: "Run `swift build` in a watch loop.",
+			discussion: """
+				Pass swift-watch's own options before any argument meant for \
+				`swift build`: everything from the first unrecognized argument \
+				onwards is forwarded untouched.
+
+				A forwarded --target or --product also scopes watching to that \
+				module's dependency closure, and forwarded --scratch-path, \
+				--build-path, and --cache-path are excluded from watching so \
+				build output cannot retrigger the loop.
+				"""
 		)
 
 		@OptionGroup var options: CommonOptions
-
-		@Option(
-			help:
-				"Build the specified target and scope watching to its dependency closure."
-		)
-		var target: String?
-
-		@Option(
-			help:
-				"Build the specified product and scope watching to its dependency closure."
-		)
-		var product: String?
 
 		@Argument(
 			parsing: .captureForPassthrough,
@@ -154,10 +152,8 @@ extension SwiftWatchCommand {
 			try exitIfHelpRequested(swiftArgs, for: self)
 			let registry = try CommonOptions.makeWatcherRegistry()
 			var executionOptions = options.executionOptions()
-			executionOptions.selection = WatchSelection(
-				explicitNames: [target, product].compactMap { $0 })
-			warnAboutForwardedSelectionFlags(in: swiftArgs)
 			let forwarded = normalizedPassthrough(self.swiftArgs)
+			executionOptions.selection = forwardedBuildSelection(in: forwarded)
 			executionOptions.excludedPaths = resolvedDirectoryOverrides(
 				in: forwarded,
 				stopAtFirstPositional: false,
@@ -169,16 +165,12 @@ extension SwiftWatchCommand {
 				packagePath: executionOptions.packagePath
 			)
 			warnAboutForwardedBuildSystem(in: forwarded, stopAtFirstPositional: false)
-			let swiftArgs =
-				(target.map { ["--target", $0] } ?? [])
-				+ (product.map { ["--product", $0] } ?? [])
-				+ forwarded
 			let options = executionOptions
 			try await runUntilInterrupted {
 				try await WatchController(watcherRegistry: registry)
 					.runBuildLoop(
 						options: options,
-						swiftArgs: swiftArgs
+						swiftArgs: forwarded
 					)
 			}
 		}
@@ -403,14 +395,18 @@ private func resolvedBuildManifest(
 	)
 }
 
-/// Selection flags hidden inside passthrough arguments still reach
-/// `swift build`, but swift-watch cannot see them, so watching stays scoped
-/// to the root package and can miss edits to the selected module.
-func forwardedSelectionFlags(in args: [String]) -> [String] {
-	args.filter { arg in
-		arg == "--target" || arg == "--product"
-			|| arg.hasPrefix("--target=") || arg.hasPrefix("--product=")
+/// The target or product selection implied by forwarded `swift build`
+/// arguments.
+///
+/// The last value for each flag wins, matching what `swift build` acts on when
+/// a flag is repeated. A malformed spelling yields no selection rather than an
+/// error: `swift build` owns its own argument diagnostics, and swift-watch
+/// validates none of the other flags it reads here.
+func forwardedBuildSelection(in args: [String]) -> WatchSelection {
+	let names = ["--target", "--product"].compactMap { flag in
+		forwardedFlagValue(of: [flag], in: args, stopAtFirstPositional: false)
 	}
+	return WatchSelection(explicitNames: names)
 }
 
 /// Warns that a build system swift-watch has no reader for leaves build tool
@@ -430,19 +426,6 @@ private func warnAboutForwardedBuildSystem(in args: [String], stopAtFirstPositio
 		Data(
 			"""
 			warning: swift-watch cannot read what the '\(system.name)' build system plans, so the inputs a build tool plugin discovers for itself will not trigger rebuilds. Declare them as target resources to watch them, or use --build-system native or swiftbuild.
-
-			""".utf8))
-}
-
-private func warnAboutForwardedSelectionFlags(in args: [String]) {
-	let flags = forwardedSelectionFlags(in: args)
-	guard !flags.isEmpty else {
-		return
-	}
-	FileHandle.standardError.write(
-		Data(
-			"""
-			warning: \(flags.joined(separator: ", ")) is being forwarded to `swift build` unseen, so watching stays scoped to the whole root package and may miss edits to the selected module. Pass --target/--product to swift-watch itself, immediately after `build`.
 
 			""".utf8))
 }
