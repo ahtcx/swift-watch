@@ -1,2 +1,2 @@
 [vars]
-swift_reproducibility_args = "-Xswiftc -gnone -Xcc -g0"
+swift_release_args = "-Xswiftc -gnone -Xcc -g0 -Xlinker -x"

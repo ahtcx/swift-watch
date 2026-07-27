@@ -15,7 +15,7 @@ let package = Package(
 		.package(url: "https://github.com/apple/swift-argument-parser.git", exact: "1.8.2"),
 		.package(
 			url: "https://github.com/swiftlang/swift-subprocess.git",
-			revision: "40243d063b41485e17501ccb9d434006bdf837a5",
+			exact: "1.0.0-beta.1",
 			traits: []
 		),
 	],

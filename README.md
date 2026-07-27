@@ -8,17 +8,28 @@ swift-watch run
 
 Edit a file, and your executable is rebuilt and restarted.
 
-## Usage
+## Install
 
 ```sh
-swift-watch build [options] [swift build args...]
-swift-watch run [options] [swift run args...]
+curl -fsSL https://raw.githubusercontent.com/ahtcx/swift-watch/main/install.sh | sh
 ```
 
-Anything swift-watch doesn't recognize is forwarded to `swift build` / `swift run`:
+Drops the latest binary in `~/.local/bin`. Run the same command again to update, and `rm ~/.local/bin/swift-watch` to uninstall.
+
+If you use [mise](https://mise.jdx.dev): `mise use -g github:ahtcx/swift-watch`. Binaries are also on the [releases page](https://github.com/ahtcx/swift-watch/releases).
+
+## Usage
+
+Take any `swift build` or `swift run` command and swap `swift` for `swift-watch`:
 
 ```sh
-swift-watch build --configuration release
+swift build --configuration release        # builds once
+swift-watch build --configuration release  # builds on every change
+```
+
+Anything swift-watch doesn't recognize is forwarded straight through:
+
+```sh
 swift-watch run MyExecutable --flag value
 swift-watch build --target MyLibrary
 swift-watch run --package-path path/to/package
@@ -48,9 +59,17 @@ Watching starts before each build, so edits made while a build is running are pi
 
 ## Plugin
 
-The package also ships a SwiftPM command plugin:
+Or skip installing and add it to your package:
+
+```swift
+dependencies: [
+	.package(url: "https://github.com/ahtcx/swift-watch.git", from: "0.0.0")
+]
+```
 
 ```sh
 swift package swift-watch build
 swift package swift-watch run
 ```
+
+SwiftPM will ask for permission to write to the package directory — pass `--allow-writing-to-package-directory` to skip the prompt.
