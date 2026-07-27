@@ -63,6 +63,27 @@ func `build loop starts watching before the first build runs`() async throws {
 }
 
 @Test
+func `test loop runs swift test and forwards its arguments`() async throws {
+	let harness = Harness(changeScript: [[source]])
+
+	try await harness.controller().runTestLoop(
+		options: harness.options,
+		swiftArgs: ["--filter", "MyTests"],
+		iterationLimit: 2
+	)
+
+	#expect(harness.log.count(of: .test) == 2)
+	#expect(harness.log.count(of: .build) == 0)
+	#expect(
+		harness.runner.runArguments == [
+			["test", "--filter", "MyTests"],
+			["test", "--filter", "MyTests"],
+		])
+	// A source edit reuses the discovered graph, same as the build loop.
+	#expect(harness.log.count(of: .describe) == 1)
+}
+
+@Test
 func `run loop forwards arguments to swift run without a separate build`() async throws {
 	let harness = Harness(changeScript: [[]])
 
@@ -118,6 +139,7 @@ private enum Event: Equatable {
 	case describe
 	case startSession
 	case build
+	case test
 	case launchRun
 }
 
@@ -159,10 +181,13 @@ private final class MockRunner: SwiftToolRunning, @unchecked Sendable {
 		return package
 	}
 
-	func runBuild(packagePath: URL, swiftBinDirectory: URL?, args: [String])
+	func runSwift(
+		subcommand: String, packagePath: URL, swiftBinDirectory: URL?, args: [String]
+	)
 		async throws(SwiftWatchError) -> Int32
 	{
-		log.record(.build)
+		log.record(subcommand == "test" ? .test : .build)
+		lock.withLock { recordedRunArguments.append([subcommand] + args) }
 		return 0
 	}
 

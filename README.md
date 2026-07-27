@@ -1,6 +1,6 @@
 # swift-watch
 
-Rerun `swift build` or `swift run` whenever your Swift package changes.
+Rerun `swift build`, `swift run`, or `swift test` whenever your Swift package changes.
 
 ```sh
 swift-watch run
@@ -20,11 +20,11 @@ If you use [mise](https://mise.jdx.dev): `mise use -g github:ahtcx/swift-watch`.
 
 ## Usage
 
-Take any `swift build` or `swift run` command and swap `swift` for `swift-watch`:
+Take any `swift build`, `swift run`, or `swift test` command and swap `swift` for `swift-watch`:
 
 ```sh
-swift build --configuration release        # builds once
-swift-watch build --configuration release  # builds on every change
+swift test --filter MyTests        # runs once
+swift-watch test --filter MyTests  # runs on every change
 ```
 
 Anything swift-watch doesn't recognize is forwarded straight through:
@@ -32,7 +32,7 @@ Anything swift-watch doesn't recognize is forwarded straight through:
 ```sh
 swift-watch run MyExecutable --flag value
 swift-watch build --target MyLibrary
-swift-watch run --package-path path/to/package
+swift-watch test --parallel
 ```
 
 Options:

@@ -18,7 +18,11 @@ import class Foundation.Process
 public protocol SwiftToolRunning {
 	func describe(packagePath: URL, swiftBinDirectory: URL?) async throws(SwiftWatchError)
 		-> DescribedPackage
-	func runBuild(packagePath: URL, swiftBinDirectory: URL?, args: [String])
+	/// Runs a `swift` subcommand to completion, inheriting the terminal so its
+	/// output reaches the user unbuffered.
+	func runSwift(
+		subcommand: String, packagePath: URL, swiftBinDirectory: URL?, args: [String]
+	)
 		async throws(SwiftWatchError)
 		-> Int32
 	func launchRun(packagePath: URL, swiftBinDirectory: URL?, args: [String])
@@ -59,13 +63,15 @@ public struct SwiftToolRunner: SwiftToolRunning {
 		}
 	}
 
-	public func runBuild(packagePath: URL, swiftBinDirectory: URL?, args: [String])
+	public func runSwift(
+		subcommand: String, packagePath: URL, swiftBinDirectory: URL?, args: [String]
+	)
 		async throws(SwiftWatchError) -> Int32
 	{
 		do {
 			let result = try await run(
 				Self.executable(swiftBinDirectory: swiftBinDirectory),
-				arguments: Arguments(["build"] + args),
+				arguments: Arguments([subcommand] + args),
 				workingDirectory: FilePath(packagePath.path),
 				output: .currentStandardOutput,
 				error: .currentStandardError

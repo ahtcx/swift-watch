@@ -44,6 +44,47 @@ public struct WatchController {
 		swiftArgs: [String],
 		iterationLimit: Int?
 	) async throws(SwiftWatchError) {
+		try await runSubcommandLoop(
+			subcommand: "build",
+			restartMessage: "Source change detected. Rebuilding...",
+			options: options,
+			swiftArgs: swiftArgs,
+			iterationLimit: iterationLimit
+		)
+	}
+
+	public func runTestLoop(options: ExecutionOptions, swiftArgs: [String])
+		async throws(SwiftWatchError)
+	{
+		try await runTestLoop(
+			options: options, swiftArgs: swiftArgs, iterationLimit: nil)
+	}
+
+	/// - Parameter iterationLimit: Stops after this many test cycles. Only used
+	///   by tests; production callers watch indefinitely.
+	func runTestLoop(
+		options: ExecutionOptions,
+		swiftArgs: [String],
+		iterationLimit: Int?
+	) async throws(SwiftWatchError) {
+		try await runSubcommandLoop(
+			subcommand: "test",
+			restartMessage: "Source change detected. Retesting...",
+			options: options,
+			swiftArgs: swiftArgs,
+			iterationLimit: iterationLimit
+		)
+	}
+
+	/// Shared loop for subcommands that run to completion, unlike `swift run`
+	/// which leaves a process to supervise.
+	private func runSubcommandLoop(
+		subcommand: String,
+		restartMessage: String,
+		options: ExecutionOptions,
+		swiftArgs: [String],
+		iterationLimit: Int?
+	) async throws(SwiftWatchError) {
 		var watch = try await startWatching(options: options)
 		defer { watch.session.stop() }
 
@@ -52,7 +93,8 @@ public struct WatchController {
 			iteration += 1
 			try AsyncSupport.checkCancellation()
 
-			_ = try await runner.runBuild(
+			_ = try await runner.runSwift(
+				subcommand: subcommand,
 				packagePath: options.packagePath,
 				swiftBinDirectory: options.swiftBinDirectory,
 				args: swiftArgs
@@ -70,7 +112,7 @@ public struct WatchController {
 				watch.session.stop()
 				watch = try await startWatching(options: options)
 			}
-			output("Source change detected. Rebuilding...")
+			output(restartMessage)
 		}
 	}
 

@@ -98,8 +98,8 @@ struct CommonOptions: ParsableArguments {
 struct SwiftWatchCommand: AsyncParsableCommand {
 	static let configuration = CommandConfiguration(
 		commandName: "swift-watch",
-		abstract: "Watch Swift packages and rerun build or run when inputs change.",
-		subcommands: [Build.self, Run.self]
+		abstract: "Watch Swift packages and rerun build, run, or test when inputs change.",
+		subcommands: [Build.self, Run.self, Test.self]
 	)
 }
 
@@ -129,6 +129,7 @@ extension SwiftWatchCommand {
 		var swiftArgs: [String] = []
 
 		mutating func run() async throws {
+			try exitIfHelpRequested(swiftArgs, for: self)
 			let registry = try CommonOptions.makeWatcherRegistry()
 			var executionOptions = options.executionOptions()
 			executionOptions.selection = WatchSelection(
@@ -155,6 +156,40 @@ extension SwiftWatchCommand {
 		}
 	}
 
+	struct Test: AsyncParsableCommand {
+		static let configuration = CommandConfiguration(
+			abstract: "Run `swift test` in a watch loop."
+		)
+
+		@OptionGroup var options: CommonOptions
+		@Argument(
+			parsing: .captureForPassthrough,
+			help: "Arguments forwarded to `swift test`.")
+		var swiftArgs: [String] = []
+
+		mutating func run() async throws {
+			try exitIfHelpRequested(swiftArgs, for: self)
+			let registry = try CommonOptions.makeWatcherRegistry()
+			var executionOptions = options.executionOptions()
+			let swiftArgs = normalizedPassthrough(self.swiftArgs)
+			// `swift test` takes no user-supplied executable, so every
+			// argument is safe to scan for redirected build output.
+			executionOptions.excludedPaths = resolvedDirectoryOverrides(
+				in: swiftArgs,
+				stopAtFirstPositional: false,
+				packagePath: executionOptions.packagePath
+			)
+			let options = executionOptions
+			try await runUntilInterrupted {
+				try await WatchController(watcherRegistry: registry)
+					.runTestLoop(
+						options: options,
+						swiftArgs: swiftArgs
+					)
+			}
+		}
+	}
+
 	struct Run: AsyncParsableCommand {
 		static let configuration = CommandConfiguration(
 			abstract: "Run `swift run` in a watch loop."
@@ -167,6 +202,7 @@ extension SwiftWatchCommand {
 		var swiftArgs: [String] = []
 
 		mutating func run() async throws {
+			try exitIfHelpRequested(swiftArgs, for: self)
 			let registry = try CommonOptions.makeWatcherRegistry()
 			var executionOptions = options.executionOptions()
 			// The first non-flag argument is `swift run`'s executable name
@@ -191,6 +227,19 @@ extension SwiftWatchCommand {
 			}
 		}
 	}
+}
+
+/// `captureForPassthrough` swallows `--help` before ArgumentParser can act on
+/// it, which would otherwise start a watch loop instead of printing help.
+///
+/// Only a leading help flag is claimed. Anything later belongs to the command
+/// being wrapped — `swift-watch run MyExecutable --help` asks the executable
+/// for its help — and an explicit `--` separator forwards it as well.
+func exitIfHelpRequested(_ args: [String], for command: some ParsableCommand) throws {
+	guard args.first == "--help" || args.first == "-h" else {
+		return
+	}
+	throw CleanExit.helpRequest(command)
 }
 
 /// `captureForPassthrough` keeps a leading `--` separator in the captured

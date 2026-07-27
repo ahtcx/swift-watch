@@ -1,3 +1,4 @@
+import ArgumentParser
 import Testing
 
 import class Foundation.Process
@@ -602,6 +603,50 @@ func `forwarded directory overrides are extracted for exclusion`() {
 }
 
 @Test
+func `a leading help flag is claimed, a later one is forwarded`() throws {
+	// `.captureForPassthrough` hides `--help` from ArgumentParser, so the
+	// subcommands claim a leading one themselves rather than start watching.
+	for argv in [["build", "--help"], ["run", "-h"], ["test", "--help"]] {
+		let command = try SwiftWatchCommand.parseAsRoot(argv)
+		guard let parsable = command as? any ParsableCommand else {
+			Issue.record("Expected a parsable command for \(argv).")
+			return
+		}
+		#expect(throws: CleanExit.self) {
+			try exitIfHelpRequested(
+				argv.count > 1 ? Array(argv.dropFirst()) : [], for: parsable)
+		}
+	}
+
+	// An executable's own help must still reach it.
+	let run = try SwiftWatchCommand.parseAsRoot(["run", "MyExecutable", "--help"])
+	guard let runCommand = run as? SwiftWatchCommand.Run else {
+		Issue.record("Expected Run command.")
+		return
+	}
+	#expect(runCommand.swiftArgs == ["MyExecutable", "--help"])
+	try exitIfHelpRequested(runCommand.swiftArgs, for: runCommand)
+}
+
+@Test
+func `test command captures trailing arguments for swift test`() throws {
+	let command = try SwiftWatchCommand.parseAsRoot([
+		"test",
+		"--package-path", "/tmp/pkg",
+		"--filter", "MyTests",
+		"--parallel",
+	])
+
+	guard let test = command as? SwiftWatchCommand.Test else {
+		Issue.record("Expected Test command.")
+		return
+	}
+
+	#expect(test.swiftArgs == ["--filter", "MyTests", "--parallel"])
+	#expect(test.options.packagePath == "/tmp/pkg")
+}
+
+@Test
 func `run command captures trailing arguments for swift run`() throws {
 	let command = try SwiftWatchCommand.parseAsRoot([
 		"run",
@@ -698,7 +743,9 @@ private final class MockRunner: SwiftToolRunning {
 		return package
 	}
 
-	func runBuild(packagePath: URL, swiftBinDirectory: URL?, args: [String])
+	func runSwift(
+		subcommand: String, packagePath: URL, swiftBinDirectory: URL?, args: [String]
+	)
 		async throws(SwiftWatchError) -> Int32
 	{
 		0
