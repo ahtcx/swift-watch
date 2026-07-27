@@ -20,32 +20,36 @@ import class Foundation.FileHandle
 #endif
 
 struct CommonOptions: ParsableArguments {
-	@Option(
-		name: .customLong("debounce"),
-		help: "Debounce window for file changes in milliseconds.")
+	@Option(help: "Debounce window for file changes in milliseconds.")
 	var debounce: Int = 300
 
-	@Option(
-		name: .customLong("poll-interval"),
-		help: "Interval between scans for the polling watcher, in milliseconds.")
+	@Option(help: "Interval between scans for the polling watcher, in milliseconds.")
 	var pollInterval: Int = 150
 
 	@Option(
-		name: .customLong("watcher"),
 		help:
 			"Watcher implementation to use. Available: \(Self.availableWatcherNames.joined(separator: ", "))."
 	)
 	var watcher: String?
 
 	@Option(
-		name: .customLong("swift-bin-dir"),
 		help:
 			"Directory containing the swift executable to invoke. By default, swift-watch resolves `swift` from PATH."
 	)
 	var swiftBinDir: String?
 
-	@Option(name: .customLong("package-path"), help: "Path to the package to watch.")
+	@Option(help: "Path to the package to watch.")
 	var packagePath: String = "."
+
+	@Option(
+		name: .customLong("disable-rule"),
+		help:
+			"Turn off a rule for judging changes, repeatable. Available: \(WatchRules.allNames.joined(separator: ", ")). Paths the build itself reports reading are always watched."
+	)
+	var disabledRules: [String] = []
+
+	@Flag(help: "Report which rule made each change count.")
+	var explain: Bool = false
 
 	func validate() throws {
 		guard debounce >= 0 else {
@@ -54,31 +58,49 @@ struct CommonOptions: ParsableArguments {
 		guard pollInterval > 0 else {
 			throw ValidationError("--poll-interval must be greater than zero.")
 		}
+		for name in disabledRules where WatchRules(name: name) == nil {
+			throw ValidationError(
+				"Unknown rule '\(name)'. Available: \(WatchRules.allNames.joined(separator: ", "))."
+			)
+		}
 	}
 
 	func executionOptions() -> ExecutionOptions {
-		ExecutionOptions(
+		// Every name is spellable by the time this runs: `validate()` rejects
+		// the ones that are not.
+		let rules = disabledRules.compactMap(WatchRules.init(name:))
+			.reduce(into: WatchRules.default) { $0.remove($1) }
+		return ExecutionOptions(
 			debounceMilliseconds: debounce,
 			pollIntervalMilliseconds: pollInterval,
 			watcherName: watcher,
 			swiftBinDirectory: swiftBinDir.map {
 				URL(fileURLWithPath: $0, isDirectory: true)
 			},
-			packagePath: URL(fileURLWithPath: packagePath, isDirectory: true)
+			packagePath: URL(fileURLWithPath: packagePath, isDirectory: true),
+			rules: rules,
+			explain: explain
 		)
 	}
 
-	fileprivate static let supportedWatcherImplementations: [FileWatcherImplementation] = {
-		var implementations: [FileWatcherImplementation] = []
-		#if os(macOS)
-			implementations.append(.fsevents)
-		#endif
-		#if os(Linux)
-			implementations.append(.inotify)
-		#endif
-		implementations.append(.polling)
-		return implementations
-	}()
+	/// The platform's native watcher, where it has one.
+	///
+	/// Conditioned on the operating system, not on `canImport`: both backend
+	/// modules exist on every platform and compile to nothing off theirs, so a
+	/// build that happens to have one in scope — a test build, which builds
+	/// every target — would otherwise select a watcher that isn't there.
+	#if os(macOS)
+		private static let nativeWatchers: [FileWatcherImplementation] = [.fsevents]
+	#elseif os(Linux)
+		private static let nativeWatchers: [FileWatcherImplementation] = [.inotify]
+	#else
+		private static let nativeWatchers: [FileWatcherImplementation] = []
+	#endif
+
+	/// Polling runs anywhere and claims no default, so it is the fallback both
+	/// when a platform has no native watcher and when the caller names none.
+	fileprivate static let supportedWatcherImplementations: [FileWatcherImplementation] =
+		nativeWatchers + [.polling]
 
 	fileprivate static let availableWatcherNames =
 		supportedWatcherImplementations
@@ -141,6 +163,12 @@ extension SwiftWatchCommand {
 				stopAtFirstPositional: false,
 				packagePath: executionOptions.packagePath
 			)
+			executionOptions.buildManifest = resolvedBuildManifest(
+				in: forwarded,
+				stopAtFirstPositional: false,
+				packagePath: executionOptions.packagePath
+			)
+			warnAboutForwardedBuildSystem(in: forwarded, stopAtFirstPositional: false)
 			let swiftArgs =
 				(target.map { ["--target", $0] } ?? [])
 				+ (product.map { ["--product", $0] } ?? [])
@@ -179,6 +207,12 @@ extension SwiftWatchCommand {
 				stopAtFirstPositional: false,
 				packagePath: executionOptions.packagePath
 			)
+			executionOptions.buildManifest = resolvedBuildManifest(
+				in: swiftArgs,
+				stopAtFirstPositional: false,
+				packagePath: executionOptions.packagePath
+			)
+			warnAboutForwardedBuildSystem(in: swiftArgs, stopAtFirstPositional: false)
 			let options = executionOptions
 			try await runUntilInterrupted {
 				try await WatchController(watcherRegistry: registry)
@@ -217,6 +251,12 @@ extension SwiftWatchCommand {
 				stopAtFirstPositional: true,
 				packagePath: executionOptions.packagePath
 			)
+			executionOptions.buildManifest = resolvedBuildManifest(
+				in: swiftArgs,
+				stopAtFirstPositional: true,
+				packagePath: executionOptions.packagePath
+			)
+			warnAboutForwardedBuildSystem(in: swiftArgs, stopAtFirstPositional: true)
 			let options = executionOptions
 			try await runUntilInterrupted {
 				try await WatchController(watcherRegistry: registry)
@@ -263,25 +303,36 @@ func normalizedPassthrough(_ args: [String]) -> [String] {
 func forwardedDirectoryOverrides(
 	in args: [String], stopAtFirstPositional: Bool
 ) -> [String] {
-	let flags = ["--scratch-path", "--build-path", "--cache-path"]
-	var paths: [String] = []
+	forwardedFlagValues(
+		of: ["--scratch-path", "--build-path", "--cache-path"],
+		in: args,
+		stopAtFirstPositional: stopAtFirstPositional
+	)
+}
+
+/// Every value forwarded for any of `flags`, in either the `--flag value` or
+/// `--flag=value` spelling, in the order they appear.
+func forwardedFlagValues(
+	of flags: [String], in args: [String], stopAtFirstPositional: Bool
+) -> [String] {
+	var values: [String] = []
 	var index = 0
 	while index < args.count {
 		let arg = args[index]
 		if flags.contains(arg) {
 			if index + 1 < args.count {
-				paths.append(args[index + 1])
+				values.append(args[index + 1])
 				index += 2
 				continue
 			}
 		} else if let flag = flags.first(where: { arg.hasPrefix($0 + "=") }) {
-			paths.append(String(arg.dropFirst(flag.count + 1)))
+			values.append(String(arg.dropFirst(flag.count + 1)))
 		} else if stopAtFirstPositional, !arg.hasPrefix("-") {
 			break
 		}
 		index += 1
 	}
-	return paths
+	return values
 }
 
 /// Resolves forwarded directory overrides the way the `swift` invocation
@@ -296,6 +347,62 @@ private func resolvedDirectoryOverrides(
 		}
 }
 
+/// The last value forwarded for any of `flags`, which is the one `swift` will
+/// act on when a flag is repeated.
+func forwardedFlagValue(
+	of flags: [String], in args: [String], stopAtFirstPositional: Bool
+) -> String? {
+	forwardedFlagValues(of: flags, in: args, stopAtFirstPositional: stopAtFirstPositional)
+		.last
+}
+
+/// The build system the forwarded arguments select, defaulting to the one
+/// `swift build` defaults to.
+func forwardedBuildSystem(in args: [String], stopAtFirstPositional: Bool) -> BuildSystem {
+	forwardedFlagValue(
+		of: ["--build-system"], in: args, stopAtFirstPositional: stopAtFirstPositional
+	).map(BuildSystem.init(name:)) ?? .default
+}
+
+/// How to read what the forwarded arguments will make `swift` plan, or `nil`
+/// when that build system records nothing swift-watch understands.
+///
+/// Every part of the path is forwarded rather than acted on by swift-watch: the
+/// build system chooses the reader, the scratch path moves the whole build tree,
+/// and the configuration can name the file. An unrecognised configuration simply
+/// resolves to a path that never exists, which reads as a package with no plugin
+/// inputs.
+///
+/// Resolving through the build system is also what keeps a scratch directory
+/// that has been used by both from being misread: the two leave their manifests
+/// side by side, so a swiftbuild invocation must not fall back to the stale
+/// `debug.yaml` a previous native build left behind.
+private func resolvedBuildManifest(
+	in args: [String], stopAtFirstPositional: Bool, packagePath: URL
+) -> BuildManifestSource? {
+	let scratchPath =
+		forwardedFlagValue(
+			of: ["--scratch-path", "--build-path"],
+			in: args,
+			stopAtFirstPositional: stopAtFirstPositional
+		).map { path in
+			URL(fileURLWithPath: path, isDirectory: true, relativeTo: packagePath)
+				.absoluteURL.standardizedFileURL
+		} ?? packagePath.appendingPathComponent(".build", isDirectory: true)
+	let configuration =
+		forwardedFlagValue(
+			of: ["-c", "--configuration"],
+			in: args,
+			stopAtFirstPositional: stopAtFirstPositional
+		) ?? "debug"
+	return BuildManifestSource(
+		buildSystem: forwardedBuildSystem(
+			in: args, stopAtFirstPositional: stopAtFirstPositional),
+		scratchPath: scratchPath,
+		configuration: configuration
+	)
+}
+
 /// Selection flags hidden inside passthrough arguments still reach
 /// `swift build`, but swift-watch cannot see them, so watching stays scoped
 /// to the root package and can miss edits to the selected module.
@@ -304,6 +411,27 @@ func forwardedSelectionFlags(in args: [String]) -> [String] {
 		arg == "--target" || arg == "--product"
 			|| arg.hasPrefix("--target=") || arg.hasPrefix("--product=")
 	}
+}
+
+/// Warns that a build system swift-watch has no reader for leaves build tool
+/// plugin inputs unwatched.
+///
+/// Everything a manifest declares is still watched — this costs only the inputs
+/// a plugin resolves for itself, which no manifest declares and only a planned
+/// build reports. A toolchain that adds a build system, or renames one, lands
+/// here rather than failing.
+private func warnAboutForwardedBuildSystem(in args: [String], stopAtFirstPositional: Bool) {
+	let system = forwardedBuildSystem(
+		in: args, stopAtFirstPositional: stopAtFirstPositional)
+	guard system.reader == nil else {
+		return
+	}
+	FileHandle.standardError.write(
+		Data(
+			"""
+			warning: swift-watch cannot read what the '\(system.name)' build system plans, so the inputs a build tool plugin discovers for itself will not trigger rebuilds. Declare them as target resources to watch them, or use --build-system native or swiftbuild.
+
+			""".utf8))
 }
 
 private func warnAboutForwardedSelectionFlags(in args: [String]) {

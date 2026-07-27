@@ -2,7 +2,6 @@ import SwiftWatch
 import Testing
 
 import class Foundation.NSLock
-import class Foundation.Process
 
 @testable import SwiftWatchRuntime
 
@@ -63,6 +62,178 @@ func `build loop starts watching before the first build runs`() async throws {
 }
 
 @Test
+func `build loop refreshes the graph when a build changes its inputs`() async throws {
+	// A build tool plugin's inputs only appear once a build has written the
+	// manifest, so the first build of a clean checkout leaves the graph stale.
+	let root = FileManager.default.temporaryDirectory.appendingPathComponent(
+		UUID().uuidString, isDirectory: true)
+	try FileManager.default.createDirectory(
+		at: root.appendingPathComponent("Sources/App", isDirectory: true),
+		withIntermediateDirectories: true)
+	defer { try? FileManager.default.removeItem(at: root) }
+	let manifestPath = root.appendingPathComponent("debug.yaml")
+	let proto = root.appendingPathComponent("Sources/App/Protos/a.proto")
+
+	let harness = Harness(
+		changeScript: [[], []],
+		packageRoot: root,
+		buildManifestPath: manifestPath,
+		onBuild: {
+			try? #"  "Gen":\#n    inputs: ["\#(proto.path)"]"#
+				.write(to: manifestPath, atomically: true, encoding: .utf8)
+		}
+	)
+
+	try await harness.controller().runBuildLoop(
+		options: harness.options,
+		swiftArgs: [],
+		iterationLimit: 3
+	)
+
+	// One refresh, then quiet: a manifest whose inputs stop changing must not
+	// keep restarting the watch, or the loop would never reach a build it waits
+	// on.
+	#expect(harness.log.count(of: .startSession) == 2)
+	#expect(harness.log.count(of: .build) == 3)
+	// The package did not change, only what the build reads, so the refresh
+	// rebuilds the graph from the description it already had. Describing again
+	// would be a subprocess — and SwiftPM's scratch lock — spent to learn
+	// nothing.
+	#expect(harness.log.count(of: .describe) == 1)
+}
+
+@Test
+func `build loop stops refreshing when the build inputs never settle`() async throws {
+	// A manifest reporting a different input set on every build would, left
+	// unbounded, rebuild forever without ever waiting on a change.
+	let root = FileManager.default.temporaryDirectory.appendingPathComponent(
+		UUID().uuidString, isDirectory: true)
+	try FileManager.default.createDirectory(
+		at: root.appendingPathComponent("Sources/App", isDirectory: true),
+		withIntermediateDirectories: true)
+	defer { try? FileManager.default.removeItem(at: root) }
+	let manifestPath = root.appendingPathComponent("debug.yaml")
+	let builds = Counter()
+
+	let harness = Harness(
+		changeScript: [[], [], [], [], []],
+		packageRoot: root,
+		buildManifestPath: manifestPath,
+		onBuild: {
+			let input = root.appendingPathComponent(
+				"Sources/App/Protos/\(builds.next()).proto")
+			try? #"  "Gen":\#n    inputs: ["\#(input.path)"]"#
+				.write(to: manifestPath, atomically: true, encoding: .utf8)
+		}
+	)
+
+	try await harness.controller().runBuildLoop(
+		options: harness.options,
+		swiftArgs: [],
+		iterationLimit: 6
+	)
+
+	// One refresh per cycle, no more: the loop reaches its wait every time
+	// instead of rebuilding on the spot forever. Six builds across three cycles
+	// of build-refresh-build-wait, and a session start for each refresh.
+	#expect(harness.log.count(of: .build) == 6)
+	#expect(harness.log.count(of: .startSession) == 4)
+}
+
+@Test
+func `build loop ignores a manifest caught between truncate and rewrite`() async throws {
+	// SwiftPM rewrites the manifest in place, so a reader can catch it empty.
+	// Reading that as "this build reads nothing" would throw the graph's plugin
+	// inputs away and restart the watch on the wreckage.
+	let root = FileManager.default.temporaryDirectory.appendingPathComponent(
+		UUID().uuidString, isDirectory: true)
+	try FileManager.default.createDirectory(
+		at: root.appendingPathComponent("Sources/App", isDirectory: true),
+		withIntermediateDirectories: true)
+	defer { try? FileManager.default.removeItem(at: root) }
+	let manifestPath = root.appendingPathComponent("debug.yaml")
+	let proto = root.appendingPathComponent("Sources/App/Protos/a.proto")
+	let builds = Counter()
+
+	let harness = Harness(
+		changeScript: [[], [], []],
+		packageRoot: root,
+		buildManifestPath: manifestPath,
+		onBuild: {
+			// A real manifest, then the empty window, then the same manifest
+			// again. Only the first build may refresh; the empty read must not
+			// look like the inputs going away.
+			let contents =
+				builds.next() == 2
+				? "" : #"  "Gen":\#n    inputs: ["\#(proto.path)"]"#
+			try? contents.write(to: manifestPath, atomically: true, encoding: .utf8)
+		}
+	)
+
+	try await harness.controller().runBuildLoop(
+		options: harness.options,
+		swiftArgs: [],
+		iterationLimit: 4
+	)
+
+	// The first build's refresh, and nothing after it: the empty read is not a
+	// change, and the third build agrees with the graph it already has.
+	#expect(harness.log.count(of: .startSession) == 2)
+	#expect(harness.output.filter { $0.hasPrefix("Build inputs changed") }.count == 1)
+}
+
+@Test
+func `build loop warns once about a manifest it cannot understand`() async throws {
+	// A manifest swift-watch stops recognising degrades silently — the build
+	// keeps working and only the undeclared plugin inputs quietly stop being
+	// watched — so it is worth saying. Once: the loop re-reads after every
+	// build, and a format that has changed will not change back this session.
+	let root = FileManager.default.temporaryDirectory.appendingPathComponent(
+		UUID().uuidString, isDirectory: true)
+	try FileManager.default.createDirectory(at: root, withIntermediateDirectories: true)
+	defer { try? FileManager.default.removeItem(at: root) }
+	let manifestPath = root.appendingPathComponent("debug.yaml")
+
+	let harness = Harness(
+		changeScript: [[], [], []],
+		packageRoot: root,
+		buildManifestPath: manifestPath,
+		onBuild: {
+			// Bytes that are not UTF-8 at all: present, and not readable.
+			try? Data([0xff, 0xfe, 0xfd]).write(to: manifestPath)
+		}
+	)
+
+	try await harness.controller().runBuildLoop(
+		options: harness.options,
+		swiftArgs: [],
+		iterationLimit: 4
+	)
+
+	let warnings = harness.output.filter { $0.hasPrefix("warning:") }
+	#expect(warnings.count == 1)
+	#expect(warnings.first?.contains("could not be read as UTF-8 text") == true)
+	// Warned, not broken: an unreadable manifest is not a changed input set, so
+	// the watch stands on what `describe` reported and never restarts.
+	#expect(harness.log.count(of: .startSession) == 1)
+	#expect(harness.log.count(of: .build) == 4)
+}
+
+@Test
+func `build loop leaves the graph alone when no manifest path is known`() async throws {
+	let harness = Harness(changeScript: [[], []])
+
+	try await harness.controller().runBuildLoop(
+		options: harness.options,
+		swiftArgs: [],
+		iterationLimit: 3
+	)
+
+	#expect(harness.log.count(of: .describe) == 1)
+	#expect(harness.log.count(of: .startSession) == 1)
+}
+
+@Test
 func `test loop runs swift test and forwards its arguments`() async throws {
 	let harness = Harness(changeScript: [[source]])
 
@@ -99,17 +270,35 @@ func `run loop forwards arguments to swift run without a separate build`() async
 
 private struct Harness {
 	let log = EventLog()
+	let lines = OutputLog()
 	let runner: MockRunner
 	let watcher: MockWatcher
-	let options = ExecutionOptions(
-		packagePath: URL(fileURLWithPath: "/root", isDirectory: true))
+	let options: ExecutionOptions
 
-	init(changeScript: [[URL]]) {
+	/// Everything the controller reported, so a test can assert on what the
+	/// user was told and not only on what the loop did.
+	var output: [String] { lines.lines }
+
+	init(
+		changeScript: [[URL]],
+		packageRoot: URL = URL(fileURLWithPath: "/root", isDirectory: true),
+		buildManifestPath: URL? = nil,
+		onBuild: (@Sendable () -> Void)? = nil
+	) {
+		let root = packageRoot.standardizedFileURL
+		var options = ExecutionOptions(packagePath: root)
+		// The fixtures write native-format manifests at an exact path, so the
+		// reader is bound directly rather than asked where its build system
+		// would put one.
+		options.buildManifest = buildManifestPath.map {
+			BuildManifestSource(reader: NativeBuildManifest(), location: $0)
+		}
+		self.options = options
 		self.runner = MockRunner(
 			log: log,
 			descriptions: [
-				"/root": DescribedPackage(
-					path: "/root",
+				root.path: DescribedPackage(
+					path: root.path,
 					dependencies: [],
 					targets: [
 						.init(
@@ -117,21 +306,48 @@ private struct Harness {
 							sources: ["main.swift"])
 					]
 				)
-			]
+			],
+			onBuild: onBuild
 		)
 		self.watcher = MockWatcher(log: log, changeScript: changeScript)
 	}
 
 	func controller() throws -> WatchController {
 		let watcher = self.watcher
+		let lines = self.lines
 		let registry = try FileWatcherRegistry(implementations: [
 			FileWatcherImplementation(name: "mock", isDefault: true) { _ in watcher }
 		])
 		return WatchController(
 			watcherRegistry: registry,
 			runner: runner,
-			output: { _ in }
+			output: { lines.record($0) }
 		)
+	}
+}
+
+private final class OutputLog: @unchecked Sendable {
+	private let lock = NSLock()
+	private var storage: [String] = []
+
+	var lines: [String] { lock.withLock { storage } }
+
+	func record(_ line: String) {
+		lock.withLock { storage.append(line) }
+	}
+}
+
+/// A source of a fresh number per call, for fixtures that must differ each time
+/// they are asked.
+private final class Counter: @unchecked Sendable {
+	private let lock = NSLock()
+	private var value = 0
+
+	func next() -> Int {
+		lock.withLock {
+			value += 1
+			return value
+		}
 	}
 }
 
@@ -161,12 +377,18 @@ private final class EventLog: @unchecked Sendable {
 private final class MockRunner: SwiftToolRunning, @unchecked Sendable {
 	private let log: EventLog
 	private let descriptions: [String: DescribedPackage]
+	private let onBuild: (@Sendable () -> Void)?
 	private let lock = NSLock()
 	private var recordedRunArguments: [[String]] = []
 
-	init(log: EventLog, descriptions: [String: DescribedPackage]) {
+	init(
+		log: EventLog,
+		descriptions: [String: DescribedPackage],
+		onBuild: (@Sendable () -> Void)? = nil
+	) {
 		self.log = log
 		self.descriptions = descriptions
+		self.onBuild = onBuild
 	}
 
 	var runArguments: [[String]] { lock.withLock { recordedRunArguments } }
@@ -188,27 +410,21 @@ private final class MockRunner: SwiftToolRunning, @unchecked Sendable {
 	{
 		log.record(subcommand == "test" ? .test : .build)
 		lock.withLock { recordedRunArguments.append([subcommand] + args) }
+		onBuild?()
 		return 0
 	}
 
-	func launchRun(packagePath: URL, swiftBinDirectory: URL?, args: [String])
-		async throws(SwiftWatchError) -> Process
-	{
+	func withRun<Result: Sendable>(
+		packagePath: URL,
+		swiftBinDirectory: URL?,
+		args: [String],
+		whileRunning: () async throws(SwiftWatchError) -> Result
+	) async throws(SwiftWatchError) -> Result {
 		log.record(.launchRun)
 		lock.withLock { recordedRunArguments.append(args) }
-
-		let process = Process()
-		process.executableURL = URL(fileURLWithPath: "/bin/sh")
-		process.arguments = ["-c", "exec sleep 30"]
-		do {
-			try process.run()
-		} catch {
-			throw SwiftWatchError.processLaunchFailed(
-				executable: "/bin/sh",
-				message: error.localizedDescription
-			)
-		}
-		return process
+		// Launching and tearing down the executable is the runner's job, and is
+		// covered there; this only has to keep the loop moving.
+		return try await whileRunning()
 	}
 }
 

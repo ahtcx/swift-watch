@@ -6,12 +6,18 @@ lockfile_platforms = ["linux-x64", "linux-arm64", "macos-arm64", "macos-x64"]
 [vars]
 swift_release_args = ""
 
+# Warnings fail the build here rather than in Package.swift, which is what
+# anyone building from source compiles through: a warning from a newer toolchain
+# should block a merge, not somebody's install. These tasks pin their own
+# compiler, so what warns here warns identically in CI.
+swift_strict_args = "-Xswiftc -warnings-as-errors"
+
 [tools]
 swift = "6.3.3"
 
 [tasks.test]
 description = "Run the test suite"
-run = "swift test"
+run = 'swift test {{ vars.swift_strict_args }}'
 
 [tasks.format]
 description = "Format Swift sources in place"
@@ -24,7 +30,7 @@ run = "swift format lint --strict --recursive --configuration .swift-format Sour
 [tasks."build:release"]
 description = "Build the release executable"
 usage = 'flag "--scratch-path <path>" help="SwiftPM scratch directory" default=".build"'
-run = 'swift build --configuration release --scratch-path {{ usage.scratch_path }} {{ vars.swift_release_args }}'
+run = 'swift build --configuration release --scratch-path {{ usage.scratch_path }} {{ vars.swift_release_args }} {{ vars.swift_strict_args }}'
 
 [tasks."build:show-bin-path"]
 description = "Print the release executable output directory"
