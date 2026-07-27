@@ -1,8 +1,5 @@
 import Subprocess
 
-import class Foundation.FileHandle
-import class Foundation.Process
-
 #if canImport(System)
 	import System
 #else
@@ -25,13 +22,24 @@ public protocol SwiftToolRunning {
 	)
 		async throws(SwiftWatchError)
 		-> Int32
-	func launchRun(packagePath: URL, swiftBinDirectory: URL?, args: [String])
-		async throws(SwiftWatchError)
-		-> Process
+	/// Runs `swift run` for as long as `whileRunning` takes, then shuts the
+	/// launched executable down before returning.
+	func withRun<Result: Sendable>(
+		packagePath: URL,
+		swiftBinDirectory: URL?,
+		args: [String],
+		whileRunning: () async throws(SwiftWatchError) -> Result
+	) async throws(SwiftWatchError) -> Result
 }
 
 public struct SwiftToolRunner: SwiftToolRunning {
-	public init() {}
+	/// How long a watched executable gets to exit after `SIGINT` before it is
+	/// killed.
+	public var terminationTimeout: Duration
+
+	public init(terminationTimeout: Duration = .seconds(30)) {
+		self.terminationTimeout = terminationTimeout
+	}
 
 	public func describe(packagePath: URL, swiftBinDirectory: URL?)
 		async throws(SwiftWatchError)
@@ -82,41 +90,62 @@ public struct SwiftToolRunner: SwiftToolRunning {
 		}
 	}
 
-	/// Launches `swift run` with the caller's arguments verbatim.
+	/// Runs `swift run` with the caller's arguments verbatim.
 	///
 	/// `swift run` performs its own build, so the arguments are never split
 	/// between a build invocation and the executable being run. Splitting them
 	/// is not possible in general: `swift-watch run MyExecutable --flag value`
 	/// carries flags that belong to the executable, not to `swift build`.
-	public func launchRun(packagePath: URL, swiftBinDirectory: URL?, args: [String])
-		async throws(SwiftWatchError) -> Process
-	{
-		let resolvedExecutable: String
-		do {
-			resolvedExecutable = try await Self.executable(
-				swiftBinDirectory: swiftBinDirectory
+	///
+	/// The executable gets its own process group, so `SIGINT` can be sent to the
+	/// group — reaching the binary `swift run` spawns as a grandchild — without
+	/// swift-watch signalling itself. Anything still alive after
+	/// `terminationTimeout` is killed.
+	///
+	/// The group is all it gets: keeping the session means it keeps the
+	/// controlling terminal, and so behaves as it would if it had been run
+	/// directly.
+	public func withRun<Result: Sendable>(
+		packagePath: URL,
+		swiftBinDirectory: URL?,
+		args: [String],
+		whileRunning: () async throws(SwiftWatchError) -> Result
+	) async throws(SwiftWatchError) -> Result {
+		let teardown: [TeardownStep] = [
+			.send(
+				signal: .interrupt,
+				toProcessGroup: true,
+				allowedDurationToNextStep: terminationTimeout
 			)
-			.resolveExecutablePath(in: .inherit).string
+		]
+		var platformOptions = PlatformOptions()
+		platformOptions.processGroupID = 0
+		// Covers the throwing and cancelled paths. A `whileRunning` that
+		// returns normally tears the executable down itself, below.
+		platformOptions.teardownSequence = teardown
+
+		do {
+			let result = try await run(
+				Self.executable(swiftBinDirectory: swiftBinDirectory),
+				arguments: Arguments(["run"] + args),
+				workingDirectory: FilePath(packagePath.path),
+				platformOptions: platformOptions,
+				input: .standardInput,
+				output: .currentStandardOutput,
+				error: .currentStandardError
+			) { execution in
+				let value = try await whileRunning()
+				// Once the body returns, `run` waits for the executable to exit
+				// on its own, which a watched executable never does.
+				await execution.teardown(using: teardown)
+				return value
+			}
+			return result.closureResult
+		} catch let error as SwiftWatchError {
+			throw error
 		} catch {
 			throw Self.launchError(for: "swift", error: error)
 		}
-		let process = Process()
-		process.executableURL = URL(fileURLWithPath: resolvedExecutable)
-		process.arguments = ["run"] + args
-		process.currentDirectoryURL = packagePath
-		process.standardInput = FileHandle.standardInput
-		process.standardOutput = FileHandle.standardOutput
-		process.standardError = FileHandle.standardError
-		do {
-			try process.run()
-		} catch {
-			throw SwiftWatchError.processLaunchFailed(
-				executable: resolvedExecutable,
-				message: error.localizedDescription
-			)
-		}
-		RunSupervisor.detachProcessGroup(for: process.processIdentifier)
-		return process
 	}
 
 	private static func executable(swiftBinDirectory: URL?) -> Executable {

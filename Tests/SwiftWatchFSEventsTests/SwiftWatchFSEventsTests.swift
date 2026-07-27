@@ -10,7 +10,7 @@ import class Foundation.FileManager
 	import Foundation
 #endif
 
-@Test
+@Test(.timeLimit(.minutes(1)))
 func `FSEvents watcher detects manifest changes`() async throws {
 	#if canImport(CoreServices)
 		let root = FileManager.default.temporaryDirectory.appendingPathComponent(
@@ -43,7 +43,15 @@ func `FSEvents watcher detects manifest changes`() async throws {
 		try await Task.sleep(for: .milliseconds(200))
 		try Data("// updated\n".utf8).write(to: manifest)
 
-		let changes = try await session.waitForChange(debounce: .milliseconds(10))
-		#expect(changes.contains(manifest.standardizedFileURL))
+		// A stream created `SinceNow` can still deliver events from just before
+		// it started, so the first batch may be carrying the fixture's own setup
+		// writes rather than the edit under test. Reading until the manifest
+		// arrives is what makes this deterministic; reading once made it fail
+		// about one run in eight. Completing the loop is the assertion, and the
+		// time limit bounds a watcher that never reports the edit at all.
+		var seen = Set<URL>()
+		while !seen.contains(manifest.standardizedFileURL) {
+			seen.formUnion(try await session.waitForChange(debounce: .milliseconds(10)))
+		}
 	#endif
 }
