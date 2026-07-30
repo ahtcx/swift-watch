@@ -37,14 +37,13 @@ public struct WatchRules: OptionSet, Sendable {
 
 	/// Watch, whole, the directories declared as target resources.
 	///
-	/// Off, only the resource files present when the package was described
-	/// count.
+	/// Off, only resource files present in the last build plan count.
 	public static let declaredResourceDirectories = WatchRules(rawValue: 1 << 2)
 
 	/// Count files under a target's sources that carry a source extension.
 	///
-	/// Off, only the sources `swift package describe` reported count, so a newly
-	/// added `.swift` file waits for the manifest edit that would rediscover it.
+	/// Off, only the sources the last build plan reported count, so a newly
+	/// added `.swift` file waits for another change to produce a new plan.
 	public static let sourceExtensions = WatchRules(rawValue: 1 << 3)
 
 	public static let `default`: WatchRules = [
@@ -74,8 +73,8 @@ public struct WatchRules: OptionSet, Sendable {
 
 /// Why a change counted, named so the reason can be reported back.
 public enum WatchRuleMatch: Equatable, Sendable {
-	/// A path the build reported reading: a described source, a declared
-	/// resource, a manifest input, or a package manifest.
+	/// A path the build reported reading, or a package manifest swift-watch
+	/// tracks alongside the plan.
 	case trackedPath
 
 	/// Inside `root`, a directory the build reads inputs from.

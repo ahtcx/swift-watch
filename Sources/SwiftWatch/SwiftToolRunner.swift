@@ -13,8 +13,6 @@ import Subprocess
 #endif
 
 public protocol SwiftToolRunning {
-	func describe(packagePath: URL, swiftBinDirectory: URL?) async throws(SwiftWatchError)
-		-> DescribedPackage
 	/// Runs a `swift` subcommand to completion, inheriting the terminal so its
 	/// output reaches the user unbuffered.
 	func runSwift(
@@ -39,36 +37,6 @@ public struct SwiftToolRunner: SwiftToolRunning {
 
 	public init(terminationTimeout: Duration = .seconds(30)) {
 		self.terminationTimeout = terminationTimeout
-	}
-
-	public func describe(packagePath: URL, swiftBinDirectory: URL?)
-		async throws(SwiftWatchError)
-		-> DescribedPackage
-	{
-		let result: ExecutionResult<Void, StringOutput<UTF8>, StringOutput<UTF8>>
-		do {
-			result = try await run(
-				Self.executable(swiftBinDirectory: swiftBinDirectory),
-				arguments: ["package", "describe", "--type", "json"],
-				workingDirectory: FilePath(packagePath.path),
-				output: .string(limit: 10 * 1024 * 1024),
-				error: .string(limit: 10 * 1024 * 1024)
-			)
-		} catch {
-			throw Self.launchError(for: "swift", error: error)
-		}
-		guard result.terminationStatus.isSuccess else {
-			throw SwiftWatchError.packageDescribeFailed(result.standardError ?? "")
-		}
-		let data = Data((result.standardOutput ?? "").utf8)
-		do {
-			return try JSONDecoder().decode(DescribedPackage.self, from: data)
-		} catch {
-			throw SwiftWatchError.decodingFailed(
-				context: "swift package describe output",
-				message: error.localizedDescription
-			)
-		}
 	}
 
 	public func runSwift(

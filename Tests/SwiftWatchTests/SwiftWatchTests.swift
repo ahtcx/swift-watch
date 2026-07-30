@@ -11,335 +11,82 @@ import Testing
 #endif
 
 @Test
-func `describe JSON decodes local dependency and sources`() throws {
-	let json = """
-		{
-		  "path": "/tmp/root",
-		  "dependencies": [
-		    {
-		      "type": "fileSystem",
-		      "identity": "dep",
-		      "path": "../dep"
-		    }
-		  ],
-		  "products": [
-		    {
-		      "name": "App",
-		      "targets": ["App"],
-		      "type": { "executable": null }
-		    }
-		  ],
-		  "targets": [
-		    {
-		      "name": "App",
-		      "path": "Sources/App",
-		      "sources": ["main.swift", "Helper.swift"],
-		      "target_dependencies": ["Core"],
-		      "product_dependencies": ["Dep"]
-		    },
-		    {
-		      "name": "Core",
-		      "path": "Sources/Core",
-		      "sources": ["Core.swift"]
-		    }
-		  ]
-		}
-		"""
+func `planned build graph follows exact inputs and local packages`() throws {
+	let container = FileManager.default.temporaryDirectory.appendingPathComponent(
+		UUID().uuidString, isDirectory: true)
+	let root = container.appendingPathComponent("root", isDirectory: true)
+	let dependency = container.appendingPathComponent("dependency", isDirectory: true)
+	let scratch = container.appendingPathComponent("scratch", isDirectory: true)
+	let app = root.appendingPathComponent("Sources/App", isDirectory: true)
+	let assets = app.appendingPathComponent("Assets", isDirectory: true)
+	let used = dependency.appendingPathComponent("Sources/Used", isDirectory: true)
+	let unused = dependency.appendingPathComponent("Sources/Unused", isDirectory: true)
+	for directory in [app, assets, used, unused, scratch] {
+		try FileManager.default.createDirectory(
+			at: directory, withIntermediateDirectories: true)
+	}
+	defer { try? FileManager.default.removeItem(at: container) }
+	for package in [root, dependency, scratch] {
+		try "// package\n".write(
+			to: package.appendingPathComponent("Package.swift"),
+			atomically: true,
+			encoding: .utf8)
+	}
 
-	let package = try JSONDecoder().decode(DescribedPackage.self, from: Data(json.utf8))
-	#expect(package.path == "/tmp/root")
-	#expect(package.targets.count == 2)
-	#expect(package.targets[0].name == "App")
-	#expect(package.targets[0].sources == ["main.swift", "Helper.swift"])
-	#expect(package.targets[0].targetDependencies == ["Core"])
-	#expect(package.targets[0].productDependencies == ["Dep"])
-	#expect(package.targets[1].targetDependencies.isEmpty)
-	#expect(package.products.count == 1)
-	#expect(package.products[0].targets == ["App"])
-	#expect(package.dependencies.count == 1)
-	#expect(package.dependencies[0].location == .fileSystem(path: "../dep"))
-}
+	let main = app.appendingPathComponent("main.swift")
+	let dependencySource = used.appendingPathComponent("Used.swift")
+	let pluginInput = app.appendingPathComponent("Protos/model.proto")
+	let remoteInput = scratch.appendingPathComponent("Remote.swift")
+	let graph = PlannedBuildGraph().graph(
+		packagePath: root,
+		inputs: [main, dependencySource, pluginInput, remoteInput],
+		inputDirectories: [app, used, assets],
+		excludedPaths: [scratch]
+	)
 
-@Test
-func `describe JSON decodes declared resources`() throws {
-	let json = """
-		{
-		  "path": "/tmp/root",
-		  "dependencies": [],
-		  "targets": [
-		    {
-		      "name": "App",
-		      "path": "Sources/App",
-		      "sources": ["main.swift"],
-		      "resources": [
-		        {
-		          "path": "/tmp/root/Sources/App/model.proto",
-		          "rule": { "copy": {} }
-		        },
-		        {
-		          "path": "/tmp/root/Sources/App/Config.json",
-		          "rule": { "process": { "localization": null } }
-		        }
-		      ]
-		    },
-		    {
-		      "name": "Core",
-		      "path": "Sources/Core",
-		      "sources": ["Core.swift"]
-		    }
-		  ]
-		}
-		"""
-
-	let package = try JSONDecoder().decode(DescribedPackage.self, from: Data(json.utf8))
-	// Both rules mark a build input, so the rule itself is not modelled.
+	#expect(graph.packageRoots == [root.standardizedFileURL, dependency.standardizedFileURL])
+	#expect(graph.sourceRoots == [app.standardizedFileURL, used.standardizedFileURL])
+	#expect(graph.trackedFiles.contains(main.standardizedFileURL))
+	#expect(graph.trackedFiles.contains(dependencySource.standardizedFileURL))
 	#expect(
-		package.targets[0].resources.map(\.path) == [
-			"/tmp/root/Sources/App/model.proto",
-			"/tmp/root/Sources/App/Config.json",
-		])
-	// A target without resources omits the key entirely.
-	#expect(package.targets[1].resources.isEmpty)
+		graph.isRelevantChange(
+			app.appendingPathComponent("New.swift")))
+	#expect(
+		!graph.isRelevantChange(
+			unused.appendingPathComponent("Unused.swift")))
+	#expect(
+		graph.isRelevantChange(
+			dependency.appendingPathComponent("Package.swift")))
+	#expect(
+		graph.isRelevantChange(
+			app.appendingPathComponent("Protos/new.graphql")))
+	#expect(
+		graph.isRelevantChange(
+			assets.appendingPathComponent("new-file-without-an-extension")))
+	#expect(!graph.packageRoots.contains(scratch.standardizedFileURL))
 }
 
 @Test
-func `package discovery recurses through local dependencies`() async throws {
-	let runner = MockRunner(descriptions: [
-		"/root": DescribedPackage(
-			path: "/root",
-			dependencies: [
-				.init(identity: "dep", location: .fileSystem(path: "/dep"))
-			],
-			targets: [
-				.init(
-					name: "App", path: "Sources/App", sources: ["main.swift"],
-					productDependencies: ["Dep"])
-			]
-		),
-		"/dep": DescribedPackage(
-			path: "/dep",
-			dependencies: [],
-			products: [.init(name: "Dep", targets: ["Dep"])],
-			targets: [.init(name: "Dep", path: "Sources/Dep", sources: ["dep.swift"])]
-		),
-	])
+func `planned directory nodes recover a custom target root`() throws {
+	let root = FileManager.default.temporaryDirectory.appendingPathComponent(
+		UUID().uuidString, isDirectory: true)
+	let target = root.appendingPathComponent("CustomTarget", isDirectory: true)
+	let nested = target.appendingPathComponent("Nested", isDirectory: true)
+	try FileManager.default.createDirectory(at: nested, withIntermediateDirectories: true)
+	defer { try? FileManager.default.removeItem(at: root) }
+	try "// package\n".write(
+		to: root.appendingPathComponent("Package.swift"),
+		atomically: true,
+		encoding: .utf8)
 
-	let graph = try await PackageDiscovery(runner: runner).discover(
-		from: URL(fileURLWithPath: "/root", isDirectory: true),
-		swiftBinDirectory: nil
+	let graph = PlannedBuildGraph().graph(
+		packagePath: root,
+		inputs: [nested.appendingPathComponent("Only.swift")],
+		inputDirectories: [target]
 	)
 
-	#expect(graph.packageRoots.map(\.path).contains("/root"))
-	#expect(graph.packageRoots.map(\.path).contains("/dep"))
-	#expect(graph.trackedFiles.map(\.path).contains("/dep/Sources/Dep/dep.swift"))
-}
-
-@Test
-func `package discovery prunes dependency targets outside the closure`() async throws {
-	let runner = MockRunner(descriptions: [
-		"/root": DescribedPackage(
-			path: "/root",
-			dependencies: [
-				.init(identity: "dep", location: .fileSystem(path: "/dep"))
-			],
-			targets: [
-				.init(
-					name: "App", path: "Sources/App", sources: ["main.swift"],
-					productDependencies: ["Used"])
-			]
-		),
-		"/dep": DescribedPackage(
-			path: "/dep",
-			dependencies: [],
-			products: [
-				.init(name: "Used", targets: ["Used"]),
-				.init(name: "Unused", targets: ["Unused"]),
-			],
-			targets: [
-				.init(name: "Used", path: "Sources/Used", sources: ["used.swift"]),
-				.init(
-					name: "Unused", path: "Sources/Unused",
-					sources: ["unused.swift"]),
-				.init(
-					name: "UsedTests", path: "Tests/UsedTests",
-					sources: ["tests.swift"],
-					targetDependencies: ["Used"]),
-			]
-		),
-	])
-
-	let graph = try await PackageDiscovery(runner: runner).discover(
-		from: URL(fileURLWithPath: "/root", isDirectory: true),
-		swiftBinDirectory: nil
-	)
-
-	let tracked = graph.trackedFiles.map(\.path)
-	#expect(tracked.contains("/dep/Sources/Used/used.swift"))
-	#expect(!tracked.contains("/dep/Sources/Unused/unused.swift"))
-	#expect(!tracked.contains("/dep/Tests/UsedTests/tests.swift"))
-	let sourceRoots = graph.sourceRoots.map(\.path)
-	#expect(sourceRoots.contains("/dep/Sources/Used"))
-	#expect(!sourceRoots.contains("/dep/Sources/Unused"))
-	// The pruned package's manifest still triggers rediscovery.
-	#expect(tracked.contains("/dep/Package.swift"))
-	#expect(graph.requiresRediscovery(for: [URL(fileURLWithPath: "/dep/Package.swift")]))
-}
-
-@Test
-func `package discovery follows product edges through transitive local packages`() async throws {
-	let runner = MockRunner(descriptions: [
-		"/root": DescribedPackage(
-			path: "/root",
-			dependencies: [
-				.init(identity: "a", location: .fileSystem(path: "/a"))
-			],
-			targets: [
-				.init(
-					name: "App", path: "Sources/App", sources: ["main.swift"],
-					productDependencies: ["A"])
-			]
-		),
-		"/a": DescribedPackage(
-			path: "/a",
-			dependencies: [
-				.init(identity: "b", location: .fileSystem(path: "/b"))
-			],
-			products: [.init(name: "A", targets: ["A"])],
-			targets: [
-				.init(
-					name: "A", path: "Sources/A", sources: ["a.swift"],
-					productDependencies: ["B"]),
-				.init(name: "AExtra", path: "Sources/AExtra", sources: ["x.swift"]),
-			]
-		),
-		"/b": DescribedPackage(
-			path: "/b",
-			dependencies: [],
-			products: [.init(name: "B", targets: ["B"])],
-			targets: [
-				.init(name: "B", path: "Sources/B", sources: ["b.swift"]),
-				.init(name: "BExtra", path: "Sources/BExtra", sources: ["y.swift"]),
-			]
-		),
-	])
-
-	let graph = try await PackageDiscovery(runner: runner).discover(
-		from: URL(fileURLWithPath: "/root", isDirectory: true),
-		swiftBinDirectory: nil
-	)
-
-	let tracked = graph.trackedFiles.map(\.path)
-	#expect(tracked.contains("/a/Sources/A/a.swift"))
-	#expect(tracked.contains("/b/Sources/B/b.swift"))
-	#expect(!tracked.contains("/a/Sources/AExtra/x.swift"))
-	#expect(!tracked.contains("/b/Sources/BExtra/y.swift"))
-}
-
-@Test
-func `target closure resolves by-name dependencies and ambiguous products broadly`() {
-	let root = URL(fileURLWithPath: "/root", isDirectory: true)
-	let depA = URL(fileURLWithPath: "/a", isDirectory: true)
-	let depB = URL(fileURLWithPath: "/b", isDirectory: true)
-	let packages: [URL: DescribedPackage] = [
-		root: DescribedPackage(
-			path: "/root",
-			dependencies: [],
-			targets: [
-				// "Shared" is not a sibling target, so it must resolve
-				// as a by-name product dependency.
-				.init(
-					name: "App", path: "Sources/App", sources: [],
-					targetDependencies: ["Shared"])
-			]
-		),
-		depA: DescribedPackage(
-			path: "/a",
-			dependencies: [],
-			products: [.init(name: "Shared", targets: ["SharedA"])],
-			targets: [.init(name: "SharedA", path: "Sources/SharedA", sources: [])]
-		),
-		depB: DescribedPackage(
-			path: "/b",
-			dependencies: [],
-			products: [.init(name: "Shared", targets: ["SharedB"])],
-			targets: [.init(name: "SharedB", path: "Sources/SharedB", sources: [])]
-		),
-	]
-
-	let reached = TargetClosure.reachedTargets(from: root, in: packages)
-
-	#expect(reached[root] == ["App"])
-	#expect(reached[depA] == ["SharedA"])
-	#expect(reached[depB] == ["SharedB"])
-}
-
-@Test
-func `explicit selection narrows the closure to the named module`() {
-	let root = URL(fileURLWithPath: "/root", isDirectory: true)
-	let dep = URL(fileURLWithPath: "/dep", isDirectory: true)
-	let packages: [URL: DescribedPackage] = [
-		root: DescribedPackage(
-			path: "/root",
-			dependencies: [],
-			targets: [
-				.init(name: "App", path: "Sources/App", sources: []),
-				.init(name: "AppTests", path: "Tests/AppTests", sources: []),
-			]
-		),
-		dep: DescribedPackage(
-			path: "/dep",
-			dependencies: [],
-			products: [.init(name: "Lib", targets: ["Lib"])],
-			targets: [
-				.init(
-					name: "Lib", path: "Sources/Lib", sources: [],
-					targetDependencies: ["LibCore"]),
-				.init(name: "LibCore", path: "Sources/LibCore", sources: []),
-			]
-		),
-	]
-
-	// A dependency's target selected by name: only its closure is watched.
-	let byTarget = TargetClosure.reachedTargets(
-		from: root, in: packages,
-		selection: WatchSelection(explicitNames: ["Lib"]))
-	#expect(byTarget[root] == nil)
-	#expect(byTarget[dep] == ["Lib", "LibCore"])
-
-	// An unresolvable name falls back to the broad root seeding.
-	let unresolved = TargetClosure.reachedTargets(
-		from: root, in: packages,
-		selection: WatchSelection(explicitNames: ["Nope"]))
-	#expect(unresolved[root] == ["App", "AppTests"])
-
-	// Candidates broaden the root seeding without replacing it.
-	let candidate = TargetClosure.reachedTargets(
-		from: root, in: packages,
-		selection: WatchSelection(candidateNames: ["Lib"]))
-	#expect(candidate[root] == ["App", "AppTests"])
-	#expect(candidate[dep] == ["Lib", "LibCore"])
-}
-
-@Test
-func `target closure falls back to all targets when the root is unknown`() {
-	let dep = URL(fileURLWithPath: "/dep", isDirectory: true)
-	let packages: [URL: DescribedPackage] = [
-		dep: DescribedPackage(
-			path: "/dep",
-			dependencies: [],
-			targets: [
-				.init(name: "A", path: "Sources/A", sources: []),
-				.init(name: "B", path: "Sources/B", sources: []),
-			]
-		)
-	]
-
-	let reached = TargetClosure.reachedTargets(
-		from: URL(fileURLWithPath: "/missing", isDirectory: true),
-		in: packages
-	)
-
-	#expect(reached[dep] == ["A", "B"])
+	#expect(graph.sourceRoots == [target.standardizedFileURL])
+	#expect(graph.isRelevantChange(target.appendingPathComponent("Sibling.swift")))
 }
 
 @Test
@@ -370,62 +117,6 @@ func `watch graph filters excluded paths and accepts relevant inputs`() {
 	#expect(
 		!graph.isRelevantChange(
 			URL(fileURLWithPath: "/tmp/pkg/Sources/App/.main.swift.swp")))
-}
-
-@Test
-func `package discovery tracks declared resources by kind`() async throws {
-	// Resources are classified against the real file system, so this fixture
-	// has to exist on disk rather than living at a synthetic path.
-	let root = FileManager.default.temporaryDirectory.appendingPathComponent(
-		UUID().uuidString, isDirectory: true)
-	let target = root.appendingPathComponent("Sources/App", isDirectory: true)
-	let protos = target.appendingPathComponent("Protos", isDirectory: true)
-	try FileManager.default.createDirectory(at: protos, withIntermediateDirectories: true)
-	defer { try? FileManager.default.removeItem(at: root) }
-	try "{}".write(
-		to: target.appendingPathComponent("Config.json"), atomically: true, encoding: .utf8)
-
-	let runner = MockRunner(descriptions: [
-		root.standardizedFileURL.path: DescribedPackage(
-			path: root.standardizedFileURL.path,
-			dependencies: [],
-			targets: [
-				.init(
-					name: "App", path: "Sources/App", sources: ["main.swift"],
-					resources: [
-						.init(path: protos.standardizedFileURL.path),
-						.init(
-							path: target.appendingPathComponent(
-								"Config.json"
-							)
-							.path),
-						// An entry that no longer exists is tracked exactly,
-						// which still catches its recreation.
-						.init(
-							path: target.appendingPathComponent(
-								"Gone.json"
-							)
-							.path),
-					])
-			]
-		)
-	])
-
-	let graph = try await PackageDiscovery(runner: runner).discover(
-		from: root, swiftBinDirectory: nil)
-
-	#expect(graph.trackedRoots.map(\.path) == [protos.standardizedFileURL.path])
-	// Resource paths arrive absolute, and a Windows one must not be read as
-	// relative and appended to the target root.
-	#expect(
-		isRelativePath(#"C:\pkg\Sources\App\Config.json"#) == false)
-	#expect(isRelativePath("/pkg/Sources/App/Config.json") == false)
-	#expect(isRelativePath("Config.json") == true)
-	#expect(isRelativePath("Protos/model.proto") == true)
-	let tracked = graph.trackedFiles.map(\.path)
-	#expect(tracked.contains(target.appendingPathComponent("Config.json").path))
-	#expect(tracked.contains(target.appendingPathComponent("Gone.json").path))
-	#expect(!tracked.contains(protos.standardizedFileURL.path))
 }
 
 @Test
@@ -497,8 +188,12 @@ func `build manifest parsing keeps file inputs and drops other node kinds`() thr
 	#expect(inputs.contains("/pkg/Sources/App/Protos/config.json"))
 	#expect(inputs.contains("/pkg/Sources/App/main.swift"))
 	#expect(inputs.contains("/pkg/Package.swift"))
-	// Directory and virtual nodes are not files to watch, and outputs are not
-	// inputs at all.
+	#expect(
+		NativeBuildManifest().readDirectories(at: path) == [
+			"/pkg/Sources/App"
+		])
+	// Directory nodes are retained separately. Virtual nodes and outputs are
+	// not filesystem inputs.
 	#expect(!inputs.contains("/pkg/Sources/App"))
 	#expect(!inputs.contains("<virtual-node>"))
 	#expect(!inputs.contains("/pkg/.build/debug/App.build/main.swift.o"))
@@ -525,10 +220,16 @@ func `a cross-compiled manifest is found under the triple it built for`() throws
 		"aarch64-unknown-linux-gnu", isDirectory: true)
 	try FileManager.default.createDirectory(at: triple, withIntermediateDirectories: true)
 	defer { try? FileManager.default.removeItem(at: scratch) }
-	try #"  "Gen":\#n    inputs: ["/pkg/Sources/App/Protos/a.proto"]"#
+	try #"commands:\#n  "Gen":\#n    inputs: ["/pkg/Sources/App/Protos/a.proto"]"#
 		.write(
 			to: triple.appendingPathComponent("debug.yaml"), atomically: true,
 			encoding: .utf8)
+	let stale = scratch.appendingPathComponent("debug.yaml")
+	try #"commands:\#n  "Gen":\#n    inputs: ["/pkg/Sources/Stale/stale.swift"]"#
+		.write(to: stale, atomically: true, encoding: .utf8)
+	try FileManager.default.setAttributes(
+		[.modificationDate: Date(timeIntervalSince1970: 1)],
+		ofItemAtPath: stale.path)
 
 	let reader = NativeBuildManifest()
 	let inputs = reader.readPaths(
@@ -542,21 +243,248 @@ func `a cross-compiled manifest is found under the triple it built for`() throws
 				scratchPath: scratch, configuration: "release")) == .unwritten)
 }
 
+@Test
+func `native build database advances a reused plan`() throws {
+	let scratch = FileManager.default.temporaryDirectory.appendingPathComponent(
+		UUID().uuidString, isDirectory: true)
+	try FileManager.default.createDirectory(at: scratch, withIntermediateDirectories: true)
+	defer { try? FileManager.default.removeItem(at: scratch) }
+
+	let plan = scratch.appendingPathComponent("debug.yaml")
+	let database = scratch.appendingPathComponent("build.db")
+	try #"commands:\#n  "Compile":\#n    inputs: ["/pkg/Sources/App/main.swift"]"#
+		.write(to: plan, atomically: true, encoding: .utf8)
+	try Data().write(to: database)
+	let planDate = Date(timeIntervalSince1970: 1_000)
+	let databaseDate = Date(timeIntervalSince1970: 2_000)
+	try FileManager.default.setAttributes(
+		[.modificationDate: planDate], ofItemAtPath: plan.path)
+	try FileManager.default.setAttributes(
+		[.modificationDate: databaseDate], ofItemAtPath: database.path)
+
+	let reader = NativeBuildManifest()
+	let location = reader.manifestLocation(
+		scratchPath: scratch, configuration: "debug")
+
+	// llbuild advances build.db on a no-op invocation while reusing debug.yaml.
+	// That still proves the exact invocation selected this readable plan.
+	#expect(reader.modificationDate(at: location) == databaseDate)
+}
+
+@Test
+func `native plan traversal narrows the reusable plan to the invoked target`() throws {
+	let scratch = FileManager.default.temporaryDirectory.appendingPathComponent(
+		UUID().uuidString, isDirectory: true)
+	try FileManager.default.createDirectory(
+		at: scratch, withIntermediateDirectories: true)
+	defer { try? FileManager.default.removeItem(at: scratch) }
+
+	let plan = scratch.appendingPathComponent("debug.yaml")
+	let yaml = [
+		"targets:",
+		#"  "Selected-arm64.module": ["<Selected>"]"#,
+		#"  "Unrelated-arm64.module": ["<Unrelated>"]"#,
+		#"default: "Unrelated-arm64.module""#,
+		"commands:",
+		#"  "SelectedCommand":"#,
+		#"    inputs: ["/pkg/Sources/Selected/main.swift","<Dependency>"]"#,
+		#"    outputs: ["<Selected>"]"#,
+		#"  "DependencyCommand":"#,
+		#"    inputs: ["/pkg/Sources/Dependency/lib.swift"]"#,
+		#"    outputs: ["<Dependency>"]"#,
+		#"  "UnrelatedCommand":"#,
+		#"    inputs: ["/pkg/Sources/Unrelated/main.swift"]"#,
+		#"    outputs: ["<Unrelated>"]"#,
+	].joined(separator: "\n")
+	try yaml.write(to: plan, atomically: true, encoding: .utf8)
+
+	#expect(
+		NativeBuildManifest().readPaths(
+			at: plan,
+			selection: WatchSelection(
+				action: .build, names: ["Selected"]))
+			== [
+				"/pkg/Sources/Dependency/lib.swift",
+				"/pkg/Sources/Selected/main.swift",
+			])
+}
+
+@Test
+func `a test selection that resolves to nothing widens instead of defaulting`() throws {
+	// The default target is the one a bare `swift build` uses, so it is exactly
+	// the target that excludes tests. Were SwiftPM to rename its `test`
+	// aggregate, falling back to the default would leave `swift-watch test` not
+	// watching a single test file — a silent narrowing, and the one direction a
+	// watcher must never fail in.
+	let scratch = FileManager.default.temporaryDirectory.appendingPathComponent(
+		UUID().uuidString, isDirectory: true)
+	try FileManager.default.createDirectory(at: scratch, withIntermediateDirectories: true)
+	defer { try? FileManager.default.removeItem(at: scratch) }
+
+	let plan = scratch.appendingPathComponent("debug.yaml")
+	try [
+		"targets:",
+		#"  "main": ["<App>"]"#,
+		#"  "renamed-tests": ["<AppTests>"]"#,
+		#"default: "main""#,
+		"commands:",
+		#"  "AppCommand":"#,
+		#"    inputs: ["/pkg/Sources/App/main.swift"]"#,
+		#"    outputs: ["<App>"]"#,
+		#"  "AppTestsCommand":"#,
+		#"    inputs: ["/pkg/Tests/AppTests/T.swift"]"#,
+		#"    outputs: ["<AppTests>"]"#,
+	].joined(separator: "\n").write(to: plan, atomically: true, encoding: .utf8)
+
+	let reader = NativeBuildManifest()
+	#expect(
+		reader.readPaths(at: plan, selection: WatchSelection(action: .test))
+			== ["/pkg/Sources/App/main.swift", "/pkg/Tests/AppTests/T.swift"])
+	// A build still narrows to the default, which is the right breadth for it.
+	#expect(
+		reader.readPaths(at: plan, selection: WatchSelection(action: .build))
+			== ["/pkg/Sources/App/main.swift"])
+}
+
+@Test
+func `a target the plan never reads from is watched, one merely unselected is not`() throws {
+	// SwiftPM compiles build tool plugins in a separate arena, so no command of
+	// the plan that consumes a plugin's output reads the plugin's own sources.
+	// A test target left out of this selection looks nothing like that: its
+	// sources are still recorded, by the closure it does belong to.
+	let scratch = FileManager.default.temporaryDirectory.appendingPathComponent(
+		UUID().uuidString, isDirectory: true)
+	try FileManager.default.createDirectory(at: scratch, withIntermediateDirectories: true)
+	defer { try? FileManager.default.removeItem(at: scratch) }
+
+	let plan = scratch.appendingPathComponent("debug.yaml")
+	try [
+		"targets:",
+		#"  "main": ["<App>"]"#,
+		#"  "test": ["<AppTests>"]"#,
+		#"default: "main""#,
+		"nodes:",
+		#"  "/pkg/Sources/App/":"#,
+		"    is-directory-structure: true",
+		"commands:",
+		#"  "AppCommand":"#,
+		#"    inputs: ["/pkg/Sources/App/main.swift"]"#,
+		#"    outputs: ["<App>"]"#,
+		#"  "AppTestsCommand":"#,
+		#"    inputs: ["/pkg/Tests/AppTests/T.swift"]"#,
+		#"    outputs: ["<AppTests>"]"#,
+		#"  "PackageStructure":"#,
+		#"    inputs: ["/pkg/Sources/App/","/pkg/Plugins/Gen/","/pkg/Tests/AppTests/","/pkg/Package.swift"]"#,
+		#"    outputs: ["<PackageStructure>"]"#,
+	].joined(separator: "\n").write(to: plan, atomically: true, encoding: .utf8)
+
+	let reading = NativeBuildManifest().read(
+		at: plan,
+		selection: WatchSelection(action: .build),
+		fileManager: .default)
+	#expect(reading.readInputs?.map(\.path).sorted() == ["/pkg/Sources/App/main.swift"])
+	#expect(reading.readUnbuiltDirectories?.map(\.path) == ["/pkg/Plugins/Gen"])
+	// The node entry is keyed and indented exactly like a command, and must not
+	// be read as one.
+	#expect(
+		reading.readInputDirectories?.map(\.path).sorted() == [
+			"/pkg/Plugins/Gen", "/pkg/Sources/App", "/pkg/Tests/AppTests",
+		])
+}
+
+@Test
+func `an unbuilt target directory becomes a source root of its own package`() throws {
+	let root = FileManager.default.temporaryDirectory.appendingPathComponent(
+		UUID().uuidString, isDirectory: true)
+	let plugin = root.appendingPathComponent("Plugins/Gen", isDirectory: true)
+	let app = root.appendingPathComponent("Sources/App", isDirectory: true)
+	try FileManager.default.createDirectory(at: plugin, withIntermediateDirectories: true)
+	try FileManager.default.createDirectory(at: app, withIntermediateDirectories: true)
+	defer { try? FileManager.default.removeItem(at: root) }
+	try "// package\n".write(
+		to: root.appendingPathComponent("Package.swift"),
+		atomically: true,
+		encoding: .utf8)
+
+	let graph = PlannedBuildGraph().graph(
+		packagePath: root,
+		inputs: [app.appendingPathComponent("main.swift")],
+		inputDirectories: [app, plugin],
+		unbuiltDirectories: [plugin])
+
+	#expect(graph.sourceRoots == [app.standardizedFileURL, plugin.standardizedFileURL])
+	#expect(graph.isRelevantChange(plugin.appendingPathComponent("plugin.swift")))
+	#expect(graph.isRelevantChange(plugin.appendingPathComponent("Added.swift")))
+	#expect(!graph.isRelevantChange(plugin.appendingPathComponent("notes.md")))
+}
+
+@Test
+func `cross-compiled database selects a reused older native plan`() throws {
+	let scratch = FileManager.default.temporaryDirectory.appendingPathComponent(
+		UUID().uuidString, isDirectory: true)
+	let triple = scratch.appendingPathComponent(
+		"aarch64-unknown-linux-gnu", isDirectory: true)
+	try FileManager.default.createDirectory(at: triple, withIntermediateDirectories: true)
+	defer { try? FileManager.default.removeItem(at: scratch) }
+
+	let hostPlan = scratch.appendingPathComponent("debug.yaml")
+	let crossPlan = triple.appendingPathComponent("debug.yaml")
+	let crossDatabase = triple.appendingPathComponent("build.db")
+	try #"commands:\#n  "Host":\#n    inputs: ["/pkg/Sources/Host/main.swift"]"#
+		.write(to: hostPlan, atomically: true, encoding: .utf8)
+	try #"commands:\#n  "Cross":\#n    inputs: ["/pkg/Sources/Cross/main.swift"]"#
+		.write(to: crossPlan, atomically: true, encoding: .utf8)
+	try Data().write(to: crossDatabase)
+	try FileManager.default.setAttributes(
+		[.modificationDate: Date(timeIntervalSince1970: 3_000)],
+		ofItemAtPath: hostPlan.path)
+	try FileManager.default.setAttributes(
+		[.modificationDate: Date(timeIntervalSince1970: 2_000)],
+		ofItemAtPath: crossPlan.path)
+	let databaseDate = Date(timeIntervalSince1970: 4_000)
+	try FileManager.default.setAttributes(
+		[.modificationDate: databaseDate],
+		ofItemAtPath: crossDatabase.path)
+
+	let reader = NativeBuildManifest()
+	let location = reader.manifestLocation(
+		scratchPath: scratch, configuration: "debug")
+
+	#expect(reader.modificationDate(at: location) == databaseDate)
+	#expect(reader.readPaths(at: location) == ["/pkg/Sources/Cross/main.swift"])
+}
+
 extension BuildManifestReading {
 	/// The input paths read at `location`, as strings, so assertions read as
 	/// the manifests do.
 	func readPaths(at location: URL) -> [String] {
 		(read(at: location, fileManager: .default).readInputs ?? []).map(\.path).sorted()
 	}
+
+	func readPaths(at location: URL, selection: WatchSelection) -> [String] {
+		(read(
+			at: location, selection: selection,
+			fileManager: .default
+		).readInputs ?? []).map(\.path).sorted()
+	}
+
+	func readDirectories(at location: URL) -> [String] {
+		(read(at: location, fileManager: .default).readInputDirectories ?? [])
+			.map(\.path).sorted()
+	}
 }
 
 /// Writes an `XCBuildData` tree holding one plan directory per entry, oldest
 /// first, so the newest is unambiguous.
+///
+/// - Parameter arena: The directory Swift Build puts its build data under, which
+///   has been spelled both `out` and the target triple across 6.x releases.
 private func writeSwiftBuildManifests(
-	_ manifests: [(hash: String, json: String)], under scratch: URL
+	_ manifests: [(hash: String, json: String)],
+	under scratch: URL,
+	arena: String = "out"
 ) throws -> URL {
-	let location = SwiftBuildManifest().manifestLocation(
-		scratchPath: scratch, configuration: "debug")
+	let location = swiftBuildData(under: scratch, arena: arena)
 	for (offset, manifest) in manifests.enumerated() {
 		let directory = location.appendingPathComponent(
 			"\(manifest.hash).xcbuilddata", isDirectory: true)
@@ -568,7 +496,16 @@ private func writeSwiftBuildManifests(
 			[.modificationDate: Date(timeIntervalSince1970: 1_000 + Double(offset))],
 			ofItemAtPath: file.path)
 	}
-	return location
+	// The reader is handed the whole build tree, since it finds the arena rather
+	// than naming it.
+	return scratch
+}
+
+private func swiftBuildData(under scratch: URL, arena: String = "out") -> URL {
+	scratch
+		.appendingPathComponent(arena, isDirectory: true)
+		.appendingPathComponent("Intermediates.noindex", isDirectory: true)
+		.appendingPathComponent("XCBuildData", isDirectory: true)
 }
 
 @Test
@@ -632,6 +569,104 @@ func `swift build manifests are read from the newest plan`() throws {
 	#expect(!inputs.contains("/pkg/Sources/App"))
 	#expect(!inputs.contains("<target-App-ModuleVerifierTaskProducer>"))
 	#expect(!inputs.contains("/pkg/.build-swiftbuild/out/Generated.swift"))
+	#expect(
+		SwiftBuildManifest().readDirectories(at: location) == [
+			"/pkg/Sources/App"
+		])
+}
+
+@Test
+func `swift build request selects a reused older plan`() throws {
+	let scratch = FileManager.default.temporaryDirectory.appendingPathComponent(
+		UUID().uuidString, isDirectory: true)
+	defer { try? FileManager.default.removeItem(at: scratch) }
+
+	let location = try writeSwiftBuildManifests(
+		[
+			(
+				"selected",
+				#"{"commands":{"SelectedCommand":{"inputs":["/pkg/selected.swift"]}}}"#
+			),
+			(
+				"newer-but-different",
+				#"{"commands":{"OtherCommand":{"inputs":["/pkg/wrong.swift"]}}}"#
+			),
+		],
+		under: scratch
+	)
+	// The guid SwiftPM configures for a forwarded --target carries a hash and
+	// may carry a `-testable` suffix, neither of which the caller spelled, so
+	// the name is matched by prefix rather than compared whole.
+	for (hash, guid) in [
+		("selected", "PACKAGE-TARGET:SelectedCommand-1DA2DD44-testable"),
+		("newer-but-different", "PACKAGE-TARGET:OtherCommand-9F110C21"),
+	] {
+		try writeBuildRequest(guids: [guid], forPlan: hash, under: location)
+	}
+
+	#expect(
+		SwiftBuildManifest().readPaths(
+			at: location,
+			selection: WatchSelection(
+				action: .build, names: ["SelectedCommand"]))
+			== ["/pkg/selected.swift"])
+}
+
+@Test
+func `swift build aggregates are matched by the test line they drew`() throws {
+	// A bare `swift build` or `swift test` configures one aggregate rather than
+	// naming targets, and the two differ only in whether tests are in them. The
+	// build plan is written first here, so recency alone would answer wrongly
+	// every time.
+	let scratch = FileManager.default.temporaryDirectory.appendingPathComponent(
+		UUID().uuidString, isDirectory: true)
+	defer { try? FileManager.default.removeItem(at: scratch) }
+
+	let location = try writeSwiftBuildManifests(
+		[
+			(
+				"build",
+				#"{"commands":{"C":{"inputs":["/pkg/Sources/App/main.swift"]}}}"#
+			),
+			("test", #"{"commands":{"C":{"inputs":["/pkg/Tests/AppTests/T.swift"]}}}"#),
+			(
+				"target",
+				#"{"commands":{"C":{"inputs":["/pkg/Sources/App/one.swift"]}}}"#
+			),
+		],
+		under: scratch
+	)
+	try writeBuildRequest(guids: ["ALL-EXCLUDING-TESTS"], forPlan: "build", under: location)
+	try writeBuildRequest(guids: ["ALL-INCLUDING-TESTS"], forPlan: "test", under: location)
+	try writeBuildRequest(
+		guids: ["PACKAGE-TARGET:App-1DA2DD44"], forPlan: "target", under: location)
+
+	let reader = SwiftBuildManifest()
+	#expect(
+		reader.readPaths(at: location, selection: WatchSelection(action: .build))
+			== ["/pkg/Sources/App/main.swift"])
+	#expect(
+		reader.readPaths(at: location, selection: WatchSelection(action: .test))
+			== ["/pkg/Tests/AppTests/T.swift"])
+	#expect(
+		reader.readPaths(
+			at: location,
+			selection: WatchSelection(action: .build, names: ["App"]))
+			== ["/pkg/Sources/App/one.swift"])
+}
+
+private func writeBuildRequest(
+	guids: [String], forPlan hash: String, under scratch: URL
+) throws {
+	let encoded = guids.map { #"{"guid":"\#($0)"}"# }.joined(separator: ",")
+	try #"{"configuredTargets":[\#(encoded)]}"#
+		.write(
+			to:
+				swiftBuildData(under: scratch)
+				.appendingPathComponent("\(hash).xcbuilddata")
+				.appendingPathComponent("build-request.json"),
+			atomically: true,
+			encoding: .utf8)
 }
 
 @Test
@@ -682,7 +717,11 @@ func `an unreadable swift build manifest reports rather than reading empty`() th
 		FileManager.default.temporaryDirectory.appendingPathComponent(
 			UUID().uuidString, isDirectory: true)
 	}
-	defer { scratches.forEach { try? FileManager.default.removeItem(at: $0) } }
+	defer {
+		for scratch in scratches {
+			try? FileManager.default.removeItem(at: scratch)
+		}
+	}
 
 	// Nothing written yet is the normal state of a clean checkout, and says so
 	// silently.
@@ -720,15 +759,42 @@ func `each reader knows where its build system writes`() {
 			scratchPath: scratch, configuration: "release"
 		).path == "/pkg/.build/release.yaml")
 
-	// Swift Build folds the configuration into a hash inside one directory, so
-	// the location is the same whatever was asked for, and the newest manifest
-	// in it is the build that just ran.
+	// Swift Build folds the configuration into a hash rather than the path, and
+	// the arena directory holding its plans is not fixed across releases, so the
+	// reader is pointed at the build tree and finds the rest itself.
 	let debug = SwiftBuildManifest().manifestLocation(
 		scratchPath: scratch, configuration: "debug")
-	#expect(debug.path == "/pkg/.build/out/Intermediates.noindex/XCBuildData")
+	#expect(debug.path == "/pkg/.build")
 	#expect(
 		SwiftBuildManifest().manifestLocation(
 			scratchPath: scratch, configuration: "release") == debug)
+}
+
+@Test
+func `a swift build plan is found whatever the arena above it is called`() throws {
+	// Swift 6.0 and 6.3 write these under `out`; 6.2 wrote them under the target
+	// triple. Naming one spelling leaves the other silently unwatched.
+	for arena in ["out", "arm64-apple-macosx"] {
+		let scratch = FileManager.default.temporaryDirectory.appendingPathComponent(
+			UUID().uuidString, isDirectory: true)
+		defer { try? FileManager.default.removeItem(at: scratch) }
+
+		let location = try writeSwiftBuildManifests(
+			[
+				(
+					"plan",
+					#"{"commands":{"C":{"inputs":["/pkg/Sources/App/main.swift"]}}}"#
+				)
+			],
+			under: scratch,
+			arena: arena
+		)
+
+		#expect(
+			SwiftBuildManifest().readPaths(at: location) == [
+				"/pkg/Sources/App/main.swift"
+			])
+	}
 }
 
 @Test
@@ -1059,6 +1125,185 @@ func `directory traversal skips hidden children but walks hidden roots`() throws
 }
 
 @Test
+func `a directory that cannot be listed is walked past, not fatal`() throws {
+	let base = FileManager.default.temporaryDirectory.appendingPathComponent(
+		UUID().uuidString, isDirectory: true)
+	let sources = base.appendingPathComponent("Sources/App", isDirectory: true)
+	let unreadable = sources.appendingPathComponent("Private", isDirectory: true)
+	try FileManager.default.createDirectory(at: unreadable, withIntermediateDirectories: true)
+	defer {
+		try? FileManager.default.setAttributes(
+			[.posixPermissions: 0o755], ofItemAtPath: unreadable.path)
+		try? FileManager.default.removeItem(at: base)
+	}
+	try "let a = 1".write(
+		to: sources.appendingPathComponent("main.swift"), atomically: true, encoding: .utf8)
+	// Nothing the graph would count either way, so the expectation below holds
+	// whether or not the process is privileged enough to read the directory.
+	try "notes".write(
+		to: unreadable.appendingPathComponent("notes.txt"), atomically: true,
+		encoding: .utf8)
+	try FileManager.default.setAttributes(
+		[.posixPermissions: 0o000], ofItemAtPath: unreadable.path)
+
+	let graph = WatchGraph(
+		packageRoots: [],
+		sourceRoots: [sources],
+		trackedFiles: [],
+		manifestFiles: [],
+		resolvedFiles: [],
+		sourceExtensions: ["swift"]
+	)
+
+	// A directory the user does not own can sit anywhere in scope. Failing the
+	// walk on it would take down a loop that has no use for its contents.
+	let files = try DirectoryTraversal.relevantFiles(
+		under: [sources], graph: graph, fileManager: .default)
+
+	#expect(files.map(\.lastPathComponent) == ["main.swift"])
+}
+
+@Test
+func `the watch scope follows the rules, not the package tree`() {
+	let pkg = URL(fileURLWithPath: "/tmp/pkg", isDirectory: true)
+	let app = pkg.appendingPathComponent("Sources/App", isDirectory: true)
+	let graph = WatchGraph(
+		packageRoots: [pkg],
+		sourceRoots: [app],
+		trackedFiles: [],
+		manifestFiles: [pkg.appendingPathComponent("Package.swift")],
+		resolvedFiles: [],
+		sourceExtensions: ["swift"],
+		buildInputs: [
+			app.appendingPathComponent("main.swift"),
+			pkg.appendingPathComponent("Protos/a.proto"),
+		]
+	)
+	let scope = graph.watchScope
+
+	// The containment rules name a root to descend from: the target's sources,
+	// and the directory a plugin reads its inputs from.
+	#expect(
+		scope.recursiveRoots == [
+			app.standardizedFileURL,
+			pkg.appendingPathComponent("Protos", isDirectory: true).standardizedFileURL,
+		])
+	// The manifest is matched by exact path, so its directory is read but not
+	// descended into — which is what keeps the rest of the package unwatched.
+	#expect(scope.shallowRoots == [pkg.standardizedFileURL])
+}
+
+@Test
+func `a directory already watched whole is not repeated as a shallow root`() {
+	let pkg = URL(fileURLWithPath: "/tmp/pkg", isDirectory: true)
+	let graph = WatchGraph(
+		packageRoots: [pkg],
+		sourceRoots: [pkg],
+		trackedFiles: [pkg.appendingPathComponent("Sources/App/main.swift")],
+		manifestFiles: [pkg.appendingPathComponent("Package.swift")],
+		resolvedFiles: [],
+		sourceExtensions: ["swift"]
+	)
+
+	// The root-package fallback watches everything from one root, so every
+	// tracked file's directory is already covered.
+	#expect(graph.watchScope.recursiveRoots == [pkg.standardizedFileURL])
+	#expect(graph.watchScope.shallowRoots.isEmpty)
+}
+
+@Test
+func `a shallow root is read without being descended into`() throws {
+	let pkg = FileManager.default.temporaryDirectory.appendingPathComponent(
+		UUID().uuidString, isDirectory: true)
+	let app = pkg.appendingPathComponent("Sources/App", isDirectory: true)
+	let nested = app.appendingPathComponent("Models", isDirectory: true)
+	let unrelated = pkg.appendingPathComponent("Documentation/Guides", isDirectory: true)
+	try FileManager.default.createDirectory(at: nested, withIntermediateDirectories: true)
+	try FileManager.default.createDirectory(at: unrelated, withIntermediateDirectories: true)
+	defer { try? FileManager.default.removeItem(at: pkg) }
+	for file in [
+		pkg.appendingPathComponent("Package.swift"),
+		app.appendingPathComponent("main.swift"),
+		nested.appendingPathComponent("Model.swift"),
+		unrelated.appendingPathComponent("Buried.swift"),
+	] {
+		try "// file\n".write(to: file, atomically: true, encoding: .utf8)
+	}
+
+	let graph = WatchGraph(
+		packageRoots: [pkg],
+		sourceRoots: [app],
+		trackedFiles: [],
+		manifestFiles: [pkg.appendingPathComponent("Package.swift")],
+		resolvedFiles: [],
+		sourceExtensions: ["swift"]
+	)
+
+	let visited = try DirectoryTraversal.directories(
+		in: graph.watchScope, graph: graph, fileManager: .default)
+
+	// The package root is read for its manifest, and stops there. A source root
+	// is followed all the way down.
+	#expect(
+		visited.map(\.lastPathComponent).sorted()
+			== ["App", "Models", pkg.lastPathComponent].sorted())
+	#expect(!visited.contains(unrelated.standardizedFileURL))
+}
+
+@Test
+func `narrowing the scope does not lose a relevant file`() throws {
+	// The scope is a performance claim resting on a correctness one: every path
+	// a rule can match has to stay reachable. Walking the whole package and
+	// filtering is the slow answer this replaces, so the two must agree.
+	let pkg = FileManager.default.temporaryDirectory.appendingPathComponent(
+		UUID().uuidString, isDirectory: true)
+	let app = pkg.appendingPathComponent("Sources/App", isDirectory: true)
+	let protos = pkg.appendingPathComponent("Protos", isDirectory: true)
+	let unrelated = pkg.appendingPathComponent("Tests/AppTests", isDirectory: true)
+	for directory in [
+		app.appendingPathComponent("Models", isDirectory: true), protos, unrelated,
+	] {
+		try FileManager.default.createDirectory(
+			at: directory, withIntermediateDirectories: true)
+	}
+	defer { try? FileManager.default.removeItem(at: pkg) }
+	for file in [
+		pkg.appendingPathComponent("Package.swift"),
+		pkg.appendingPathComponent("Package.resolved"),
+		pkg.appendingPathComponent("README.md"),
+		app.appendingPathComponent("main.swift"),
+		app.appendingPathComponent("Models/Model.swift"),
+		protos.appendingPathComponent("a.proto"),
+		protos.appendingPathComponent("notes.txt"),
+		unrelated.appendingPathComponent("T.swift"),
+	] {
+		try "// file\n".write(to: file, atomically: true, encoding: .utf8)
+	}
+
+	let graph = PlannedBuildGraph().graph(
+		packagePath: pkg,
+		inputs: [
+			app.appendingPathComponent("main.swift"),
+			app.appendingPathComponent("Models/Model.swift"),
+			protos.appendingPathComponent("a.proto"),
+		],
+		inputDirectories: [app]
+	)
+
+	let scoped = Set(
+		try DirectoryTraversal.relevantFiles(
+			in: graph.watchScope, graph: graph, fileManager: .default))
+	let wholePackage = Set(
+		try DirectoryTraversal.relevantFiles(
+			under: [pkg], graph: graph, fileManager: .default))
+
+	#expect(scoped == wholePackage)
+	// And the point of it: the test target nobody selected is never walked.
+	#expect(!scoped.contains(unrelated.appendingPathComponent("T.swift").standardizedFileURL))
+	#expect(scoped.contains(protos.appendingPathComponent("notes.txt").standardizedFileURL))
+}
+
+@Test
 func `watch graph prunes traversal of infrastructure and excluded roots`() {
 	let graph = WatchGraph(
 		packageRoots: [URL(fileURLWithPath: "/tmp/pkg", isDirectory: true)],
@@ -1089,8 +1334,8 @@ func `watch graph prunes traversal of infrastructure and excluded roots`() {
 
 @Test
 func `tracked files outrank the exclusion heuristics`() {
-	// Exact paths from `swift package describe` are authoritative, so a
-	// name-based heuristic must not silence them.
+	// Exact paths from the build plan are authoritative, so a name-based
+	// heuristic must not silence them.
 	let tracked = URL(fileURLWithPath: "/tmp/pkg/.gen/.#odd.swift")
 	let graph = WatchGraph(
 		packageRoots: [URL(fileURLWithPath: "/tmp/pkg", isDirectory: true)],
@@ -1102,27 +1347,6 @@ func `tracked files outrank the exclusion heuristics`() {
 	)
 
 	#expect(graph.isRelevantChange(tracked))
-}
-
-@Test
-func `watch graph only requires rediscovery for manifest inputs`() {
-	let manifest = URL(fileURLWithPath: "/tmp/pkg/Package.swift")
-	let resolved = URL(fileURLWithPath: "/tmp/pkg/Package.resolved")
-	let source = URL(fileURLWithPath: "/tmp/pkg/Sources/App/main.swift")
-
-	let graph = WatchGraph(
-		packageRoots: [URL(fileURLWithPath: "/tmp/pkg", isDirectory: true)],
-		sourceRoots: [URL(fileURLWithPath: "/tmp/pkg/Sources/App", isDirectory: true)],
-		trackedFiles: [manifest, resolved, source],
-		manifestFiles: [manifest],
-		resolvedFiles: [resolved],
-		sourceExtensions: ["swift"]
-	)
-
-	#expect(!graph.requiresRediscovery(for: [source]))
-	#expect(graph.requiresRediscovery(for: [source, manifest]))
-	#expect(graph.requiresRediscovery(for: [resolved]))
-	#expect(!graph.requiresRediscovery(for: [URL]()))
 }
 
 @Test
@@ -1255,39 +1479,10 @@ func `build command keeps target and product in forwarded arguments`() throws {
 			"--product", "Bar",
 			"--configuration", "release",
 		])
-}
-
-@Test
-func `forwarded build selection is read from forwarded arguments`() {
-	#expect(
-		forwardedBuildSelection(in: ["--target", "Foo", "-v"]).explicitNames
-			== ["Foo"])
-	#expect(
-		forwardedBuildSelection(in: ["--product=Bar"]).explicitNames
-			== ["Bar"])
 	#expect(
 		forwardedBuildSelection(
-			in: ["--target", "Old", "--configuration", "release", "--target=New"]
-		).explicitNames == ["New"])
-	#expect(
-		forwardedBuildSelection(
-			in: ["--target", "Foo", "--product", "Bar"]
-		).explicitNames == ["Foo", "Bar"])
-	#expect(
-		forwardedBuildSelection(in: ["--configuration", "release"]).explicitNames
-			.isEmpty)
-}
-
-@Test
-func `a malformed selection flag selects nothing rather than failing`() {
-	// `swift build` reports its own argument errors, and an unresolved name
-	// would fall back to watching the whole root package anyway.
-	#expect(forwardedBuildSelection(in: ["--target"]).explicitNames.isEmpty)
-	#expect(
-		forwardedBuildSelection(in: ["--target="]).explicitNames == [""])
-	#expect(
-		forwardedBuildSelection(in: ["--product", "--configuration", "release"])
-			.explicitNames == ["--configuration"])
+			in: normalizedPassthrough(build.swiftArgs)
+		).names == ["Foo", "Bar"])
 }
 
 @Test
@@ -1410,47 +1605,53 @@ func `run command captures trailing arguments for swift run`() throws {
 }
 
 @Test
-func `swift tool runner resolves swift from PATH`() async throws {
-	let root = FileManager.default.temporaryDirectory.appendingPathComponent(
-		UUID().uuidString,
-		isDirectory: true
-	)
-	let sources = root.appendingPathComponent("Sources/App", isDirectory: true)
-	try FileManager.default.createDirectory(at: sources, withIntermediateDirectories: true)
-	defer { try? FileManager.default.removeItem(at: root) }
-
-	let manifest = """
-		// swift-tools-version: 6.0
-		import PackageDescription
-
-		let package = Package(
-			name: "TempPackage",
-			targets: [
-				.executableTarget(name: "App")
-			]
-		)
-		"""
-	try manifest.write(
-		to: root.appendingPathComponent("Package.swift"),
-		atomically: true,
-		encoding: .utf8
-	)
-	try "print(\"hello\")\n".write(
-		to: sources.appendingPathComponent("main.swift"),
-		atomically: true,
-		encoding: .utf8
-	)
-
-	let package = try await SwiftToolRunner().describe(
-		packagePath: root,
-		swiftBinDirectory: nil
-	)
-
+func `swift run invocation finds the executable after SwiftPM options`() {
 	#expect(
-		URL(fileURLWithPath: package.path).standardizedFileURL
-			== root.standardizedFileURL
-	)
-	#expect(package.targets.contains { $0.path == "Sources/App" })
+		forwardedRunInvocation(in: ["MyExecutable", "--app-flag", "value"])
+			== ForwardedRunInvocation(
+				optionArguments: [],
+				executable: "MyExecutable"))
+	#expect(
+		forwardedRunInvocation(
+			in: [
+				"--configuration", "release",
+				"--scratch-path=.scratch",
+				"-Xswiftc", "-DFEATURE",
+				"MyExecutable",
+				"--configuration", "belongs-to-the-executable",
+			])
+			== ForwardedRunInvocation(
+				optionArguments: [
+					"--configuration", "release",
+					"--scratch-path=.scratch",
+					"-Xswiftc", "-DFEATURE",
+				],
+				executable: "MyExecutable"))
+	#expect(
+		forwardedRunInvocation(
+			in: ["--configuration", "release", "--", "MyExecutable", "--app-flag"])
+			== ForwardedRunInvocation(
+				optionArguments: ["--configuration", "release"],
+				executable: "MyExecutable"))
+}
+
+@Test
+func `swift run invocation stays broad for unknown or absent executables`() {
+	#expect(
+		forwardedRunInvocation(in: ["--configuration", "release"])
+			== ForwardedRunInvocation(
+				optionArguments: ["--configuration", "release"],
+				executable: nil))
+	#expect(
+		forwardedRunInvocation(in: ["--future-option", "value", "MyExecutable"])
+			== ForwardedRunInvocation(
+				optionArguments: [],
+				executable: nil))
+	#expect(
+		forwardedRunInvocation(in: ["--configuration"])
+			== ForwardedRunInvocation(
+				optionArguments: ["--configuration"],
+				executable: nil))
 }
 
 private struct StubWatcher: FileWatcher {
@@ -1462,38 +1663,4 @@ private struct StubWatcher: FileWatcher {
 private final class StubSession: FileWatcherSession {
 	func waitForChange(debounce: Duration) async throws(SwiftWatchError) -> [URL] { [] }
 	func stop() {}
-}
-
-private final class MockRunner: SwiftToolRunning {
-	let descriptions: [String: DescribedPackage]
-
-	init(descriptions: [String: DescribedPackage]) {
-		self.descriptions = descriptions
-	}
-
-	func describe(packagePath: URL, swiftBinDirectory: URL?) async throws(SwiftWatchError)
-		-> DescribedPackage
-	{
-		guard let package = descriptions[packagePath.standardizedFileURL.path] else {
-			throw SwiftWatchError.packageDescribeFailed(packagePath.path)
-		}
-		return package
-	}
-
-	func runSwift(
-		subcommand: String, packagePath: URL, swiftBinDirectory: URL?, args: [String]
-	)
-		async throws(SwiftWatchError) -> Int32
-	{
-		0
-	}
-
-	func withRun<Result: Sendable>(
-		packagePath: URL,
-		swiftBinDirectory: URL?,
-		args: [String],
-		whileRunning: () async throws(SwiftWatchError) -> Result
-	) async throws(SwiftWatchError) -> Result {
-		fatalError("unused")
-	}
 }

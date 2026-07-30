@@ -24,7 +24,7 @@ public struct ExecutionOptions: Sendable {
 	/// CLI resolves it from the same arguments it forwards.
 	///
 	/// Absent when the forwarded build system records nothing swift-watch can
-	/// read, which costs only the inputs no manifest declares.
+	/// read; the controller then uses its root-package fallback graph.
 	public var buildManifest: BuildManifestSource?
 
 	/// Which widening rules apply when judging a change.

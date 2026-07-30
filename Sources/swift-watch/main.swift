@@ -134,10 +134,9 @@ extension SwiftWatchCommand {
 				`swift build`: everything from the first unrecognized argument \
 				onwards is forwarded untouched.
 
-				A forwarded --target or --product also scopes watching to that \
-				module's dependency closure, and forwarded --scratch-path, \
-				--build-path, and --cache-path are excluded from watching so \
-				build output cannot retrigger the loop.
+				The exact plan written by that invocation defines what is watched. \
+				Forwarded --scratch-path, --build-path, and --cache-path are \
+				excluded so build output cannot retrigger the loop.
 				"""
 		)
 
@@ -191,6 +190,7 @@ extension SwiftWatchCommand {
 			try exitIfHelpRequested(swiftArgs, for: self)
 			let registry = try CommonOptions.makeWatcherRegistry()
 			var executionOptions = options.executionOptions()
+			executionOptions.selection = WatchSelection(action: .test)
 			let swiftArgs = normalizedPassthrough(self.swiftArgs)
 			// `swift test` takes no user-supplied executable, so every
 			// argument is safe to scan for redirected build output.
@@ -231,24 +231,24 @@ extension SwiftWatchCommand {
 			try exitIfHelpRequested(swiftArgs, for: self)
 			let registry = try CommonOptions.makeWatcherRegistry()
 			var executionOptions = options.executionOptions()
-			// The first non-flag argument is `swift run`'s executable name
-			// when one is given. It only ever broadens the watch, so a flag
-			// value misread as a name resolves to nothing and changes nothing.
-			executionOptions.selection = WatchSelection(
-				candidateNames: swiftArgs.first { !$0.hasPrefix("-") }
-					.map { [$0] } ?? [])
 			let swiftArgs = normalizedPassthrough(self.swiftArgs)
+			let invocation = forwardedRunInvocation(in: swiftArgs)
+			executionOptions.selection = WatchSelection(
+				action: .run,
+				names: invocation.executable.map { [$0] } ?? [])
 			executionOptions.excludedPaths = resolvedDirectoryOverrides(
-				in: swiftArgs,
-				stopAtFirstPositional: true,
+				in: invocation.optionArguments,
+				stopAtFirstPositional: false,
 				packagePath: executionOptions.packagePath
 			)
 			executionOptions.buildManifest = resolvedBuildManifest(
-				in: swiftArgs,
-				stopAtFirstPositional: true,
+				in: invocation.optionArguments,
+				stopAtFirstPositional: false,
 				packagePath: executionOptions.packagePath
 			)
-			warnAboutForwardedBuildSystem(in: swiftArgs, stopAtFirstPositional: true)
+			warnAboutForwardedBuildSystem(
+				in: invocation.optionArguments,
+				stopAtFirstPositional: false)
 			let options = executionOptions
 			try await runUntilInterrupted {
 				try await WatchController(watcherRegistry: registry)
@@ -259,6 +259,105 @@ extension SwiftWatchCommand {
 			}
 		}
 	}
+}
+
+func forwardedBuildSelection(in args: [String]) -> WatchSelection {
+	WatchSelection(
+		action: .build,
+		names: ["--target", "--product"].compactMap { flag in
+			forwardedFlagValue(
+				of: [flag], in: args,
+				stopAtFirstPositional: false)
+		})
+}
+
+struct ForwardedRunInvocation: Equatable {
+	let optionArguments: [String]
+	let executable: String?
+}
+
+/// Splits SwiftPM's options from `swift run`'s executable and its arguments.
+///
+/// Values belonging to SwiftPM options are skipped even when they look
+/// positional or flag-shaped. Once the executable is found, everything after
+/// it belongs to that executable. An option this version does not understand
+/// leaves the selection broad instead of risking narrowing to the option's
+/// value.
+func forwardedRunInvocation(in args: [String]) -> ForwardedRunInvocation {
+	var index = 0
+	while index < args.count {
+		let argument = args[index]
+		if argument == "--" {
+			let executableIndex = index + 1
+			return ForwardedRunInvocation(
+				optionArguments: Array(args[..<index]),
+				executable: executableIndex < args.count
+					? args[executableIndex] : nil)
+		}
+		if !argument.hasPrefix("-") {
+			return ForwardedRunInvocation(
+				optionArguments: Array(args[..<index]),
+				executable: argument)
+		}
+		if SelfClosingRunOptions.names.contains(argument) {
+			index += 1
+			continue
+		}
+		if RunValueOptions.names.contains(argument) {
+			guard index + 1 < args.count else {
+				return ForwardedRunInvocation(
+					optionArguments: args, executable: nil)
+			}
+			index += 2
+			continue
+		}
+		if let equals = argument.firstIndex(of: "="),
+			RunValueOptions.names.contains(String(argument[..<equals]))
+		{
+			index += 1
+			continue
+		}
+		return ForwardedRunInvocation(
+			optionArguments: Array(args[..<index]),
+			executable: nil)
+	}
+	return ForwardedRunInvocation(optionArguments: args, executable: nil)
+}
+
+private enum RunValueOptions {
+	static let names: Set<String> = [
+		"--package-path", "--cache-path", "--config-path", "--security-path",
+		"--scratch-path", "--swift-sdks-path", "--toolset", "--pkg-config-path",
+		"--manifest-cache", "--netrc-file", "--resolver-fingerprint-checking",
+		"--resolver-signing-entity-checking", "--default-registry-url",
+		"-c", "--configuration", "-Xcc", "-Xswiftc", "-Xlinker", "-Xcxx",
+		"--triple", "--sdk", "--toolchain", "--swift-sdk", "--sanitize",
+		"-j", "--jobs", "--explicit-target-dependency-import-check",
+		"--build-system", "-debug-info-format", "--traits",
+	]
+}
+
+private enum SelfClosingRunOptions {
+	static let names: Set<String> = [
+		"-v", "--verbose", "--very-verbose", "--vv", "-q", "--quiet",
+		"--enable-dependency-cache", "--disable-dependency-cache",
+		"--enable-build-manifest-caching", "--disable-build-manifest-caching",
+		"--enable-experimental-prebuilts", "--disable-experimental-prebuilts",
+		"--color-diagnostics", "--no-color-diagnostics", "--disable-sandbox",
+		"--netrc", "--enable-netrc", "--disable-netrc", "--enable-keychain",
+		"--disable-keychain", "--enable-signature-validation",
+		"--disable-signature-validation", "--enable-prefetching",
+		"--disable-prefetching", "--force-resolved-versions",
+		"--disable-automatic-resolution", "--only-use-versions-from-resolved-file",
+		"--skip-update", "--disable-scm-to-registry-transformation",
+		"--use-registry-identity-for-scm", "--replace-scm-with-registry",
+		"--auto-index-store", "--enable-index-store", "--disable-index-store",
+		"--enable-parseable-module-interfaces", "--use-integrated-swift-driver",
+		"--enable-dead-strip", "--disable-dead-strip", "--disable-local-rpath",
+		"--enable-all-traits", "--disable-default-traits", "--repl", "--debugger",
+		"--run", "--skip-build", "--build-tests", "--version",
+		"-h", "-help", "--help",
+	]
 }
 
 /// `captureForPassthrough` swallows `--help` before ArgumentParser can act on
@@ -395,27 +494,9 @@ private func resolvedBuildManifest(
 	)
 }
 
-/// The target or product selection implied by forwarded `swift build`
-/// arguments.
-///
-/// The last value for each flag wins, matching what `swift build` acts on when
-/// a flag is repeated. A malformed spelling yields no selection rather than an
-/// error: `swift build` owns its own argument diagnostics, and swift-watch
-/// validates none of the other flags it reads here.
-func forwardedBuildSelection(in args: [String]) -> WatchSelection {
-	let names = ["--target", "--product"].compactMap { flag in
-		forwardedFlagValue(of: [flag], in: args, stopAtFirstPositional: false)
-	}
-	return WatchSelection(explicitNames: names)
-}
-
-/// Warns that a build system swift-watch has no reader for leaves build tool
-/// plugin inputs unwatched.
-///
-/// Everything a manifest declares is still watched — this costs only the inputs
-/// a plugin resolves for itself, which no manifest declares and only a planned
-/// build reports. A toolchain that adds a build system, or renames one, lands
-/// here rather than failing.
+/// Warns that a build system swift-watch has no reader for must use the
+/// root-package fallback. A toolchain that adds a build system, or renames one,
+/// lands here rather than failing.
 private func warnAboutForwardedBuildSystem(in args: [String], stopAtFirstPositional: Bool) {
 	let system = forwardedBuildSystem(
 		in: args, stopAtFirstPositional: stopAtFirstPositional)
@@ -425,7 +506,7 @@ private func warnAboutForwardedBuildSystem(in args: [String], stopAtFirstPositio
 	FileHandle.standardError.write(
 		Data(
 			"""
-			warning: swift-watch cannot read what the '\(system.name)' build system plans, so the inputs a build tool plugin discovers for itself will not trigger rebuilds. Declare them as target resources to watch them, or use --build-system native or swiftbuild.
+			warning: swift-watch cannot read what the '\(system.name)' build system plans, so it will watch source-shaped files in the root package. Use --build-system native or swiftbuild for an exact planned-input graph.
 
 			""".utf8))
 }

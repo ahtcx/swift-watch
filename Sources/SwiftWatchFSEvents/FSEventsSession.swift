@@ -41,7 +41,7 @@ import class Foundation.NSLock
 		}
 
 		func start() throws(SwiftWatchError) {
-			let paths = graph.watchedDirectories.map(\.path)
+			let paths = graph.watchScope.allRoots.map(\.path)
 			guard !paths.isEmpty else {
 				throw SwiftWatchError.watcherStartFailed(
 					backend: "FSEvents",

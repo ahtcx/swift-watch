@@ -131,7 +131,7 @@ import class Foundation.FileManager
 
 		private func refreshWatches() throws(SwiftWatchError) {
 			let directories = try DirectoryTraversal.directories(
-				under: graph.watchedDirectories,
+				in: graph.watchScope,
 				graph: graph,
 				fileManager: FileManager.default
 			)
@@ -261,7 +261,7 @@ import class Foundation.FileManager
 		private func resynchronise() throws(SwiftWatchError) {
 			try refreshWatches()
 			for file in try DirectoryTraversal.relevantFiles(
-				under: graph.watchedDirectories,
+				in: graph.watchScope,
 				graph: graph,
 				fileManager: FileManager.default
 			) {

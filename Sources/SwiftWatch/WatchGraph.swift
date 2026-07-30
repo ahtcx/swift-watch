@@ -12,11 +12,9 @@ public struct WatchGraph: Sendable {
 	/// Directories declared as target resources, such as a `.copy` of a whole
 	/// directory of build tool plugin inputs.
 	///
-	/// `describe` reports the directory itself rather than its contents, so
-	/// these match by prefix. Everything inside one is a build input whatever
-	/// it is named, so they also bypass the `sourceExtensions` filter — the
-	/// point of declaring a resource directory is that the compiler's notion
-	/// of a source file does not apply to it.
+	/// The planned build reports the directory itself rather than only its
+	/// current contents, so these match by prefix. Everything inside one is a
+	/// build input whatever it is named.
 	///
 	/// Note that SwiftPM's copy of a resource directory makes FSEvents report
 	/// the copied files a second time, so an edit under one of these costs a
@@ -29,12 +27,10 @@ public struct WatchGraph: Sendable {
 	public let sourceExtensions: Set<String>
 
 	/// Build inputs read out of the llbuild build manifest, filtered to paths
-	/// inside a discovered package.
+	/// inside a package participating in the exact plan.
 	///
-	/// These resolve what no manifest declares and `describe` cannot report:
-	/// the files a build tool plugin discovers for itself. They are also the
-	/// signal for refreshing the graph — a build whose input set differs from
-	/// this one has changed what needs watching.
+	/// These are the authoritative inputs of the invocation swift-watch ran,
+	/// including files a build tool plugin discovers for itself.
 	public let buildInputs: Set<URL>
 
 	/// Directories a build reads inputs from, watched whole.
@@ -184,13 +180,11 @@ public struct WatchGraph: Sendable {
 		return (inputRoots, extensions)
 	}
 
-	/// The manifest inputs worth watching: those inside a discovered package and
+	/// The manifest inputs worth watching: those inside a planned package and
 	/// not pruned.
 	///
 	/// A build manifest also records the build's own output, the toolchain, and
-	/// SDK headers. Exposed so a caller can compare a freshly read manifest
-	/// against a graph's `buildInputs` without the discarded paths masquerading
-	/// as a change.
+	/// SDK headers.
 	public static func relevantBuildInputs(
 		_ inputs: Set<URL>,
 		packageRoots: Set<URL>,
@@ -207,18 +201,31 @@ public struct WatchGraph: Sendable {
 			})
 	}
 
-	public var watchedDirectories: [URL] {
-		Array(packageRoots.union(sourceRoots)).sorted { $0.path < $1.path }
+	/// Where a watcher has to look, and how far down.
+	///
+	/// Derived from the rules rather than from the package layout, so a narrow
+	/// plan is a narrow watch. Everything a rule can match is reachable from one
+	/// of these roots: the rules that widen by containment name a root to descend
+	/// from, and the rules that match an exact path — a build input, a manifest —
+	/// need only the directory holding it, since a file cannot change without its
+	/// own directory being read.
+	public var watchScope: WatchScope {
+		let recursive = Self.outermost(
+			sourceRoots.union(buildInputRoots).union(trackedRoots))
+		// A directory already inside something watched recursively adds nothing.
+		let shallow = Set(
+			trackedFiles.union(manifestFiles).union(resolvedFiles)
+				.map { $0.deletingLastPathComponent().standardizedFileURL }
+		).filter { directory in
+			!recursive.contains { directory.isWithin($0) }
+		}
+		return WatchScope(recursiveRoots: recursive, shallowRoots: shallow)
 	}
 
-	/// Whether any of `changes` invalidates the discovered package graph.
-	///
-	/// Only manifest and resolved-file edits can change the set of watched
-	/// inputs, so only those justify rerunning `swift package describe`.
-	public func requiresRediscovery(for changes: some Sequence<URL>) -> Bool {
-		changes.contains { change in
-			let url = change.standardizedFileURL
-			return manifestFiles.contains(url) || resolvedFiles.contains(url)
+	/// Drops any root that another root already contains.
+	private static func outermost(_ roots: Set<URL>) -> Set<URL> {
+		roots.filter { root in
+			!roots.contains { $0 != root && root.isWithin($0) }
 		}
 	}
 
@@ -307,7 +314,7 @@ public struct WatchGraph: Sendable {
 	/// a change under one can never affect the build, however source-like its
 	/// name (emacs lock files such as `.#main.swift` carry a real source
 	/// extension). Only components below the root are judged: the root itself
-	/// is a described path and may legitimately be hidden.
+	/// is an exact planned path and may legitimately be hidden.
 	private func hasHiddenComponent(_ url: URL, below root: URL) -> Bool {
 		url.path.dropFirst(root.path.count).split(separator: "/").contains {
 			$0.hasPrefix(".")

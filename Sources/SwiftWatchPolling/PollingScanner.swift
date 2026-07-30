@@ -15,7 +15,7 @@ enum PollingScanner {
 	) throws(SwiftWatchError) -> [URL: FileSignature] {
 		var result: [URL: FileSignature] = [:]
 		try DirectoryTraversal.walk(
-			roots: graph.packageRoots,
+			scope: graph.watchScope,
 			graph: graph,
 			fileManager: fileManager,
 			onDirectory: { _ in },

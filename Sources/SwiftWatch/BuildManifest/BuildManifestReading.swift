@@ -1,3 +1,4 @@
+import struct Foundation.Date
 import class Foundation.FileManager
 
 #if canImport(FoundationEssentials)
@@ -9,20 +10,17 @@ import class Foundation.FileManager
 /// Reads the inputs of a planned build out of whatever the build system leaves
 /// behind when it plans one.
 ///
-/// This is the only place a build tool plugin's inputs can be resolved. A
-/// plugin declares them at planning time, in code, so `swift package describe`
-/// cannot report them — plugins such as grpc-swift's discover their `.proto`
-/// files by scanning the source tree, and nothing about them appears in the
-/// manifest the package author writes. The planned build, on the other hand,
-/// records every command with the exact paths it reads.
+/// This is the source of truth for the watch graph. The planned build has
+/// already applied the exact arguments the user supplied and records every
+/// command with the paths it reads, including inputs a plugin discovers at
+/// planning time.
 ///
 /// Every conformance reads a build system's own intermediate output rather than
 /// a public interface, so all of them share one discipline: name as little of
 /// the format as the inputs can be found with, skip anything unrecognised
 /// instead of failing, and report a file that exists but cannot be understood
-/// so the user hears about it once. A read that comes up short leaves the watch
-/// graph exactly as `swift package describe` built it, which is a watcher that
-/// misses plugin inputs rather than one that breaks.
+/// so the user hears about it once. A read that comes up short falls back to a
+/// broad root-package source watch rather than breaking the loop.
 public protocol BuildManifestReading: Sendable {
 	/// The `--build-system` spelling this reads for, used in diagnostics.
 	var buildSystemName: String { get }
@@ -36,15 +34,34 @@ public protocol BuildManifestReading: Sendable {
 	/// to ignore it.
 	func manifestLocation(scratchPath: URL, configuration: String) -> URL
 
-	/// What `location` says the planned build reads.
-	func read(at location: URL, fileManager: FileManager) -> PlannedBuild
+	/// What `location` says the planned build reads, narrowed to `selection`
+	/// when the build system stores a reusable plan broader than one invocation.
+	func read(
+		at location: URL,
+		selection: WatchSelection?,
+		fileManager: FileManager
+	) -> PlannedBuild
+
+	/// The newest plan or build-system state backing a reading, used to
+	/// distinguish the build just started from an earlier invocation. Build
+	/// systems may reuse a plan without rewriting it, while their database still
+	/// advances for every build.
+	func modificationDate(at location: URL, fileManager: FileManager) -> Date?
 }
 
 extension BuildManifestReading {
 	/// Reads through the process-wide file manager, for callers with no reason
 	/// to substitute one.
 	public func read(at location: URL) -> PlannedBuild {
-		read(at: location, fileManager: .default)
+		read(at: location, selection: nil, fileManager: .default)
+	}
+
+	public func read(at location: URL, fileManager: FileManager) -> PlannedBuild {
+		read(at: location, selection: nil, fileManager: fileManager)
+	}
+
+	public func modificationDate(at location: URL) -> Date? {
+		modificationDate(at: location, fileManager: .default)
 	}
 }
 
@@ -70,15 +87,47 @@ public enum PlannedBuild: Equatable, Sendable {
 	/// about once: it means a format changed underneath swift-watch.
 	case unreadable(reason: String)
 
-	/// The file paths the planned build records as inputs. Never empty.
-	case inputs(Set<URL>)
+	/// The paths the planned build records as inputs. At least one of `files`
+	/// and `directories` is nonempty.
+	case inputs(
+		files: Set<URL>,
+		directories: Set<URL>,
+		unbuiltDirectories: Set<URL>)
 
 	/// The inputs read, or `nil` when there was nothing to learn.
 	public var readInputs: Set<URL>? {
-		guard case .inputs(let inputs) = self else {
+		guard case .inputs(let inputs, _, _) = self else {
 			return nil
 		}
 		return inputs
+	}
+
+	/// Directory-structure nodes recorded by the plan.
+	public var readInputDirectories: Set<URL>? {
+		guard case .inputs(_, let directories, _) = self else {
+			return nil
+		}
+		return directories
+	}
+
+	/// Target directories the plan names but reads nothing from, at any
+	/// selection.
+	///
+	/// The shape of a target another plan builds. A build tool plugin is the
+	/// case that matters: SwiftPM compiles plugins into the separate
+	/// `plugin-tools` arena, so a plugin's own sources appear in no command of
+	/// the manifest that consumes its output, while its directory is still
+	/// listed among the package's structure. Watching them is what makes
+	/// editing a plugin rebuild the targets it generates for.
+	///
+	/// A target merely left out of *this* selection is not among these: its
+	/// sources are still recorded by the commands of the closure it does belong
+	/// to, which is what keeps `swift-watch build` from watching test targets.
+	public var readUnbuiltDirectories: Set<URL>? {
+		guard case .inputs(_, _, let directories) = self else {
+			return nil
+		}
+		return directories
 	}
 
 	/// The reason a manifest could not be understood, when that is what
@@ -92,8 +141,17 @@ public enum PlannedBuild: Equatable, Sendable {
 
 	/// The reading for a set of paths that may be empty, which is how every
 	/// reader reports what it collected: nothing collected is `unwritten`.
-	static func inputs(collected paths: Set<URL>) -> PlannedBuild {
-		paths.isEmpty ? .unwritten : .inputs(paths)
+	static func inputs(
+		collected paths: Set<URL>,
+		directories: Set<URL> = [],
+		unbuiltDirectories: Set<URL> = []
+	) -> PlannedBuild {
+		paths.isEmpty && directories.isEmpty
+			? .unwritten
+			: .inputs(
+				files: paths,
+				directories: directories,
+				unbuiltDirectories: unbuiltDirectories)
 	}
 }
 
@@ -128,23 +186,33 @@ public struct BuildManifestSource: Sendable {
 		)
 	}
 
-	public func read(fileManager: FileManager = .default) -> PlannedBuild {
-		reader.read(at: location, fileManager: fileManager)
+	public func read(
+		selection: WatchSelection? = nil,
+		fileManager: FileManager = .default
+	) -> PlannedBuild {
+		reader.read(
+			at: location, selection: selection,
+			fileManager: fileManager)
+	}
+
+	public func modificationDate(fileManager: FileManager = .default) -> Date? {
+		reader.modificationDate(at: location, fileManager: fileManager)
 	}
 }
 
 /// The llbuild node kinds a manifest names, which both readers share because
 /// both describe llbuild builds.
 enum BuildInputNode {
-	/// The file `path` names, or `nil` when it names something that is not a
-	/// file on disk: virtual nodes are angle-bracketed (`<PackageStructure>`),
-	/// and directory nodes carry a trailing separator. Directories are dropped
-	/// because they name whole target trees, which the watch graph already
-	/// covers through its source roots.
-	static func fileURL(_ path: String) -> URL? {
-		guard !path.isEmpty, !path.hasPrefix("<"), !path.hasSuffix("/") else {
+	enum Path {
+		case file(URL)
+		case directory(URL)
+	}
+
+	static func path(_ path: String) -> Path? {
+		guard !path.isEmpty, !path.hasPrefix("<") else {
 			return nil
 		}
-		return URL(fileURLWithPath: path).standardizedFileURL
+		let url = URL(fileURLWithPath: path).standardizedFileURL
+		return path.hasSuffix("/") ? .directory(url) : .file(url)
 	}
 }
