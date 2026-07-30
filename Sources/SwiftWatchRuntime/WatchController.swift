@@ -114,6 +114,7 @@ public struct WatchController {
 				acceptBuildPlan: planIsFresh)
 			let changes = try await waitForRelevantChange(
 				startedAt: startedAt,
+				plannedAt: planIsFresh ? planDate : nil,
 				watch: watch,
 				options: options,
 				triggeredBy: triggeringChanges,
@@ -167,9 +168,11 @@ public struct WatchController {
 					options: options,
 					newerThan: previousPlanDate,
 					reporter: &reporter)
+				let planDate = options.buildManifest?.modificationDate(
+					fileManager: fileManager)
+				let planIsFresh = planDate != previousPlanDate
 				reporter.noteCycle(
-					foundPlan: options.buildManifest?.modificationDate(
-						fileManager: fileManager) != nil,
+					foundPlan: planDate != nil,
 					from: options.buildManifest?.location)
 				// Unlike the build loop there is no return to wait on, so a
 				// plan that has not arrived may only be late. The last one
@@ -182,6 +185,7 @@ public struct WatchController {
 				defer { watch.session.stop() }
 				let changesDuringBuild = try relevantChanges(
 					since: startedAt,
+					plannedAt: planIsFresh ? planDate : nil,
 					graph: watch.graph,
 					triggeredBy: triggeringChanges,
 					reporter: &reporter)
@@ -283,6 +287,7 @@ public struct WatchController {
 
 	private func waitForRelevantChange(
 		startedAt: Date,
+		plannedAt planDate: Date?,
 		watch: Watch,
 		options: ExecutionOptions,
 		triggeredBy triggeringChanges: Set<URL>,
@@ -291,6 +296,7 @@ public struct WatchController {
 		defer { watch.session.stop() }
 		let changesDuringBuild = try relevantChanges(
 			since: startedAt,
+			plannedAt: planDate,
 			graph: watch.graph,
 			triggeredBy: triggeringChanges,
 			reporter: &reporter)
@@ -352,8 +358,21 @@ public struct WatchController {
 	///   definition and would otherwise retrigger the build they caused,
 	///   forever. An edit to one of them *during* the invocation is later than
 	///   the start and still counts.
+	///
+	/// - Parameter planDate: When the plan this cycle accepted was written, if
+	///   this cycle produced a fresh one. Planning inputs are reconciled to that
+	///   moment instead of to the invocation's start, because planning both
+	///   reads and writes them: SwiftPM updating `Package.resolved` while
+	///   resolving dependencies lands after the invocation began and would
+	///   otherwise read as an edit the invocation missed. The plan is written
+	///   after resolution finishes, so a lockfile no newer than the plan is
+	///   already accounted for by it, and only a write past the plan is a change
+	///   the plan does not describe. Compilation inputs keep the invocation's
+	///   own start: the compiler reads them partway through, and an edit after
+	///   that must still count.
 	private func relevantChanges(
 		since date: Date,
+		plannedAt planDate: Date?,
 		graph: WatchGraph,
 		triggeredBy triggeringChanges: Set<URL>,
 		reporter: inout BuildManifestReporter
@@ -375,6 +394,12 @@ public struct WatchController {
 					.contentModificationDate
 			else {
 				return false
+			}
+			// Strictly later, so a lockfile stamped in the same instant as the
+			// plan that consumed it — the ordinary outcome on a filesystem
+			// stamping whole seconds — stays the plan's own write.
+			if let planDate, graph.isPlanningInput(url) {
+				return modified > planDate
 			}
 			if modified >= date {
 				return true

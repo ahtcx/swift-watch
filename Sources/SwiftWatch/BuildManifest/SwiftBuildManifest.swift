@@ -228,7 +228,13 @@ public struct SwiftBuildManifest: BuildManifestReading {
 	}
 
 	private func modificationDate(of url: URL) -> Date {
-		(try? url.resourceValues(forKeys: [.contentModificationDateKey]))?
+		// Asked through a URL made here and thrown away, because a URL caches
+		// every resource value it has been asked for. The location this reader is
+		// built around outlives the session, so reading it directly would report
+		// the first plan it ever saw for every cycle after — and the loop decides
+		// a plan is this invocation's by seeing that date advance.
+		(try? URL(fileURLWithPath: url.path)
+			.resourceValues(forKeys: [.contentModificationDateKey]))?
 			.contentModificationDate ?? .distantPast
 	}
 

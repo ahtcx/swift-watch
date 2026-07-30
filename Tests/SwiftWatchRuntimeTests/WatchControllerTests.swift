@@ -320,6 +320,246 @@ func `an edit stamped just before the build counts once, not forever`() async th
 	#expect(harness.output.filter { $0 == "Watching for source changes..." }.count == 2)
 }
 
+/// A package on disk with a manifest, a lockfile and one source file, all
+/// stamped well before whatever reads them.
+///
+/// The planning-boundary tests need real files: the cutoff they exercise is a
+/// comparison between two modification times on disk.
+private func makePlannedPackage() throws -> (root: URL, plan: URL, source: URL) {
+	let root = FileManager.default.temporaryDirectory.appendingPathComponent(
+		UUID().uuidString, isDirectory: true)
+	try FileManager.default.createDirectory(
+		at: root.appendingPathComponent("Sources/App", isDirectory: true),
+		withIntermediateDirectories: true)
+	let source = root.appendingPathComponent("Sources/App/main.swift")
+	try "// source\n".write(to: source, atomically: true, encoding: .utf8)
+	try "// manifest\n".write(
+		to: root.appendingPathComponent("Package.swift"),
+		atomically: true, encoding: .utf8)
+	try "{}\n".write(
+		to: root.appendingPathComponent("Package.resolved"),
+		atomically: true, encoding: .utf8)
+	let old = Date().addingTimeInterval(-3600)
+	for name in ["Package.swift", "Package.resolved", "Sources/App/main.swift"] {
+		try stamp(root.appendingPathComponent(name), at: old)
+	}
+	return (root, root.appendingPathComponent("debug.yaml"), source)
+}
+
+private func stamp(_ url: URL, at date: Date) throws {
+	try FileManager.default.setAttributes(
+		[.modificationDate: date], ofItemAtPath: url.path)
+}
+
+/// Hands out one plan timestamp per build, each well past the last.
+///
+/// The controller decides a plan is fresh by comparing its modification time
+/// against the one the cycle started with, and a scripted loop writes several
+/// plans inside a single filesystem timestamp — macOS hands two writes
+/// microseconds apart the same date. Stamping each plan explicitly is what makes
+/// these fixtures behave like builds separated by real time. The instants run
+/// forward from the loop's own start, which is where a plan written during an
+/// invocation lands.
+///
+/// The step is wide enough that a fixture can place a lockfile a whole second
+/// either side of a plan without colliding with the next one, since a filesystem
+/// keeping whole seconds is exactly what these tests have to survive.
+private final class PlanClock: @unchecked Sendable {
+	private let start = Date()
+	private let counter = Counter()
+
+	func stampNext(_ plan: URL) -> Date {
+		let instant = start.addingTimeInterval(Double(counter.next()) * 10)
+		try? stamp(plan, at: instant)
+		return instant
+	}
+}
+
+/// Writes a plan naming `source` as the only input of the build, and reports
+/// the instant it is stamped with.
+@discardableResult
+private func writePlan(_ plan: URL, reading source: URL, clock: PlanClock) -> Date {
+	try? #"commands:\#n  "C":\#n    inputs: ["\#(source.path)"]"#
+		.write(to: plan, atomically: true, encoding: .utf8)
+	return clock.stampNext(plan)
+}
+
+@Test
+func `a lockfile written no later than the plan does not start another cycle`() async throws {
+	// SwiftPM rewrites Package.resolved while resolving dependencies, which is
+	// part of producing the plan rather than an edit the plan missed. Reconciling
+	// it back to the invocation's start reported SwiftPM's own write as a source
+	// change, and the loop rebuilt on it forever.
+	let (root, plan, source) = try makePlannedPackage()
+	defer { try? FileManager.default.removeItem(at: root) }
+	let resolved = root.appendingPathComponent("Package.resolved")
+	let clock = PlanClock()
+
+	let harness = Harness(
+		changeScript: [[], [], []],
+		packageRoot: root,
+		buildManifestPath: plan,
+		onBuild: {
+			try? "{\"pins\": []}\n".write(
+				to: resolved, atomically: true, encoding: .utf8)
+			let planned = writePlan(plan, reading: source, clock: clock)
+			// Stamped to the plan's own instant, which is the boundary case: a
+			// filesystem keeping whole seconds gives resolution and planning the
+			// same timestamp, and equality must still read as the plan's write.
+			try? stamp(resolved, at: planned)
+		}
+	)
+
+	try await harness.controller().runBuildLoop(
+		options: harness.options,
+		swiftArgs: [],
+		iterationLimit: 3
+	)
+
+	#expect(harness.log.count(of: .build) == 3)
+	// Every cycle waited on the watcher rather than reconciling its way into the
+	// next build.
+	#expect(harness.output.filter { $0 == "Watching for source changes..." }.count == 3)
+}
+
+@Test
+func `a lockfile written after the plan starts another cycle`() async throws {
+	// The other half of the boundary: a lockfile the plan does not describe is
+	// still a reason to rebuild, whoever wrote it.
+	let (root, plan, source) = try makePlannedPackage()
+	defer { try? FileManager.default.removeItem(at: root) }
+	let resolved = root.appendingPathComponent("Package.resolved")
+	let clock = PlanClock()
+
+	let harness = Harness(
+		changeScript: [[], []],
+		packageRoot: root,
+		buildManifestPath: plan,
+		onBuild: {
+			let planned = writePlan(plan, reading: source, clock: clock)
+			try? "{\"pins\": []}\n".write(
+				to: resolved, atomically: true, encoding: .utf8)
+			try? stamp(resolved, at: planned.addingTimeInterval(1))
+		}
+	)
+
+	try await harness.controller().runBuildLoop(
+		options: harness.options,
+		swiftArgs: [],
+		iterationLimit: 2
+	)
+
+	// Reconciled into the next build every time, so the watcher is never waited
+	// on at all.
+	#expect(harness.output.filter { $0 == "Watching for source changes..." }.isEmpty)
+	#expect(
+		harness.output.filter { $0 == "Source change detected. Rebuilding..." }.count == 2)
+}
+
+@Test
+func `a source edited while the build ran still starts another cycle`() async throws {
+	// Compilation inputs keep the invocation's own start as their cutoff: the
+	// compiler reads them partway through, so an edit landing before the plan is
+	// written is one this build may well have missed.
+	let (root, plan, source) = try makePlannedPackage()
+	defer { try? FileManager.default.removeItem(at: root) }
+	let clock = PlanClock()
+
+	let harness = Harness(
+		changeScript: [[], []],
+		packageRoot: root,
+		buildManifestPath: plan,
+		onBuild: {
+			// Written before the plan, exactly where the lockfile above sits, and
+			// stamped before it too. A compilation input is judged against the
+			// invocation, not the plan, so this still counts.
+			try? "// edited\n".write(to: source, atomically: true, encoding: .utf8)
+			writePlan(plan, reading: source, clock: clock)
+		}
+	)
+
+	// One cycle, because only the first is a claim about the cutoff. The edit
+	// this build missed is the trigger of the next one, and whether editing it
+	// again *then* counts is the rounding window's business, not this test's:
+	// on a filesystem keeping whole seconds the second edit carries the first
+	// one's timestamp, which is precisely what a trigger is held back for.
+	try await harness.controller().runBuildLoop(
+		options: harness.options,
+		swiftArgs: [],
+		iterationLimit: 1
+	)
+
+	#expect(harness.output.filter { $0 == "Watching for source changes..." }.isEmpty)
+	#expect(
+		harness.output.filter { $0 == "Source change detected. Rebuilding..." }.count == 1)
+}
+
+@Test
+func `the rounding window still applies once when a fresh plan exists`() async throws {
+	// The planning boundary must not disturb the reach back past an invocation's
+	// start that covers whole-second filesystems, nor the trigger set that keeps
+	// it from firing forever.
+	let (root, plan, source) = try makePlannedPackage()
+	defer { try? FileManager.default.removeItem(at: root) }
+	// Stamped inside the rounding window and never touched again.
+	try stamp(source, at: Date())
+	let clock = PlanClock()
+
+	let harness = Harness(
+		changeScript: [[], [], []],
+		packageRoot: root,
+		buildManifestPath: plan,
+		onBuild: { writePlan(plan, reading: source, clock: clock) }
+	)
+
+	try await harness.controller().runBuildLoop(
+		options: harness.options,
+		swiftArgs: [],
+		iterationLimit: 3
+	)
+
+	#expect(harness.log.count(of: .build) == 3)
+	// One immediate follow-up, then the loop settles onto the watcher.
+	#expect(harness.output.filter { $0 == "Watching for source changes..." }.count == 2)
+}
+
+@Test
+func `run loop does not repeat when planning rewrites the lockfile`() async throws {
+	// The reported symptom, at the loop that reported it: `swift run` plans and
+	// runs in one call, so SwiftPM's write to Package.resolved always lands after
+	// the invocation began.
+	let (root, plan, source) = try makePlannedPackage()
+	defer { try? FileManager.default.removeItem(at: root) }
+	let resolved = root.appendingPathComponent("Package.resolved")
+	let clock = PlanClock()
+
+	let harness = Harness(
+		changeScript: [[], []],
+		packageRoot: root,
+		buildManifestPath: plan,
+		onBuild: {
+			// Resolution writes the lockfile, then planning writes the plan.
+			let planned = writePlan(plan, reading: source, clock: clock)
+			try? "{\"pins\": []}\n".write(
+				to: resolved, atomically: true, encoding: .utf8)
+			try? stamp(resolved, at: planned.addingTimeInterval(-1))
+		}
+	)
+
+	try await harness.controller().runRunLoop(
+		options: harness.options,
+		swiftArgs: [],
+		iterationLimit: 2
+	)
+
+	#expect(harness.log.count(of: .launchRun) == 2)
+	#expect(harness.output.filter { $0 == "Watching for source changes..." }.count == 2)
+	#expect(
+		harness.output.filter {
+			$0 == "Source change detected. Rebuilding and restarting..."
+		}.isEmpty)
+}
+
 @Test
 func `build loop leaves the graph alone when no manifest path is known`() async throws {
 	let harness = Harness(changeScript: [[], []])
@@ -495,6 +735,9 @@ private final class MockRunner: SwiftToolRunning, @unchecked Sendable {
 	) async throws(SwiftWatchError) -> Result {
 		log.record(.launchRun)
 		lock.withLock { recordedRunArguments.append(args) }
+		// `swift run` plans, builds and launches in one call, so a fixture's
+		// writes belong before the body that waits on the plan they produce.
+		onBuild?()
 		// Launching and tearing down the executable is the runner's job, and is
 		// covered there; this only has to keep the loop moving.
 		return try await whileRunning()

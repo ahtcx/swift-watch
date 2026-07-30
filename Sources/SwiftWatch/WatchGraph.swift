@@ -257,6 +257,18 @@ public struct WatchGraph: Sendable {
 		matchedRule(for: candidate) != nil
 	}
 
+	/// Whether `candidate` is read while planning the build rather than while
+	/// compiling it.
+	///
+	/// The manifest and the lockfile are consumed before the plan exists, and
+	/// SwiftPM writes to the lockfile as part of the same step. That makes them
+	/// the only inputs whose changes can be attributed to a plan rather than
+	/// only compared against the invocation that produced it.
+	public func isPlanningInput(_ candidate: URL) -> Bool {
+		let url = candidate.standardizedFileURL
+		return manifestFiles.contains(url) || resolvedFiles.contains(url)
+	}
+
 	/// Which rule makes `candidate` relevant, or `nil` if none does.
 	///
 	/// The order below is the design, not an implementation detail. A path the
