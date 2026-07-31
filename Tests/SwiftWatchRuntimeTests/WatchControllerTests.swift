@@ -423,6 +423,39 @@ func `a lockfile written no later than the plan does not start another cycle`() 
 }
 
 @Test
+func `a manifest edited before the plan still starts another cycle`() async throws {
+	// SwiftPM can read Package.swift early, then finish planning after an edit
+	// lands. The completed plan's timestamp cannot prove that it consumed the
+	// edit, so manifests retain the invocation-start cutoff.
+	let (root, plan, source) = try makePlannedPackage()
+	defer { try? FileManager.default.removeItem(at: root) }
+	let manifest = root.appendingPathComponent("Package.swift")
+	let clock = PlanClock()
+
+	let harness = Harness(
+		changeScript: [[]],
+		packageRoot: root,
+		buildManifestPath: plan,
+		onBuild: {
+			try? "// edited manifest\n".write(
+				to: manifest, atomically: true, encoding: .utf8)
+			let planned = writePlan(plan, reading: source, clock: clock)
+			try? stamp(manifest, at: planned.addingTimeInterval(-1))
+		}
+	)
+
+	try await harness.controller().runBuildLoop(
+		options: harness.options,
+		swiftArgs: [],
+		iterationLimit: 1
+	)
+
+	#expect(harness.output.filter { $0 == "Watching for source changes..." }.isEmpty)
+	#expect(
+		harness.output.filter { $0 == "Source change detected. Rebuilding..." }.count == 1)
+}
+
+@Test
 func `a lockfile written after the plan starts another cycle`() async throws {
 	// The other half of the boundary: a lockfile the plan does not describe is
 	// still a reason to rebuild, whoever wrote it.

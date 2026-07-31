@@ -360,16 +360,11 @@ public struct WatchController {
 	///   the start and still counts.
 	///
 	/// - Parameter planDate: When the plan this cycle accepted was written, if
-	///   this cycle produced a fresh one. Planning inputs are reconciled to that
-	///   moment instead of to the invocation's start, because planning both
-	///   reads and writes them: SwiftPM updating `Package.resolved` while
-	///   resolving dependencies lands after the invocation began and would
-	///   otherwise read as an edit the invocation missed. The plan is written
-	///   after resolution finishes, so a lockfile no newer than the plan is
-	///   already accounted for by it, and only a write past the plan is a change
-	///   the plan does not describe. Compilation inputs keep the invocation's
-	///   own start: the compiler reads them partway through, and an edit after
-	///   that must still count.
+	///   this cycle produced a fresh one. The root lockfile is reconciled to that
+	///   moment instead of to the invocation's start because SwiftPM may rewrite
+	///   it while resolving the plan. Manifests and compilation inputs keep the
+	///   invocation's own start: SwiftPM may have read them before a later edit,
+	///   even when that edit predates the completed plan.
 	private func relevantChanges(
 		since date: Date,
 		plannedAt planDate: Date?,
@@ -398,7 +393,7 @@ public struct WatchController {
 			// Strictly later, so a lockfile stamped in the same instant as the
 			// plan that consumed it — the ordinary outcome on a filesystem
 			// stamping whole seconds — stays the plan's own write.
-			if let planDate, graph.isPlanningInput(url) {
+			if let planDate, graph.isResolvedFile(url) {
 				return modified > planDate
 			}
 			if modified >= date {
