@@ -31,6 +31,10 @@ func `planned build graph follows exact inputs and local packages`() throws {
 			to: package.appendingPathComponent("Package.swift"),
 			atomically: true,
 			encoding: .utf8)
+		try "{\"pins\": []}\n".write(
+			to: package.appendingPathComponent("Package.resolved"),
+			atomically: true,
+			encoding: .utf8)
 	}
 
 	let main = app.appendingPathComponent("main.swift")
@@ -57,6 +61,10 @@ func `planned build graph follows exact inputs and local packages`() throws {
 	#expect(
 		graph.isRelevantChange(
 			dependency.appendingPathComponent("Package.swift")))
+	#expect(graph.isRelevantChange(root.appendingPathComponent("Package.resolved")))
+	#expect(
+		!graph.isRelevantChange(
+			dependency.appendingPathComponent("Package.resolved")))
 	#expect(
 		graph.isRelevantChange(
 			app.appendingPathComponent("Protos/new.graphql")))

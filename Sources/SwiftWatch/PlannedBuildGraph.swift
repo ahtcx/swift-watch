@@ -71,9 +71,11 @@ public struct PlannedBuildGraph {
 
 		let manifestFiles = Set(
 			packageRoots.map { $0.appendingPathComponent("Package.swift") })
-		let resolvedFiles = Set(
-			packageRoots.map { $0.appendingPathComponent("Package.resolved") }
-				.filter { fileManager.fileExists(atPath: $0.path) })
+		// SwiftPM resolves the graph from the root package. A local dependency's
+		// lockfile does not participate in this invocation.
+		let resolved = root.appendingPathComponent("Package.resolved")
+		let resolvedFiles: Set<URL> =
+			fileManager.fileExists(atPath: resolved.path) ? [resolved] : []
 
 		var sourceRoots = unbuiltRoots
 		for (input, packageRoot) in inputPackages
